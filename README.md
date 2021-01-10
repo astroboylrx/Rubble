@@ -18,6 +18,6 @@ It will automatically install all the required modules. Also, if you are using I
 
 # Usage
 
-Check out the Jupyter Notebooks under the `doc` folder. More examples will be added soon.
+Check out the Jupyter Notebooks under the `doc/JupyterNotebooks` folder. More examples will be added soon.
 
 You may also try `help(Rubble)`.
