@@ -6,6 +6,7 @@ import numpy as np
 import copy
 sys.path.append("..")
 from rubble.rubble import Rubble
+from rubble.rubble_data import RubbleData
 
 class BasicTestSuite(unittest.TestCase):
     """ Basic test cases. """
@@ -13,6 +14,7 @@ class BasicTestSuite(unittest.TestCase):
     def test_rubble_with_example_paras(self):
         """ simple test """
 
+        # test a quick full model simulation
         alpha = np.logspace(-3, -2, 5)
         u_f = np.logspace(2, 3, 5)
         npts = 5
@@ -33,15 +35,30 @@ class BasicTestSuite(unittest.TestCase):
 
         idx = 0
         u_idx = 3
-        r = Rubble(151, 1e-3, 1e4, 3.5, Sigma_d[idx], u_f=u_f[u_idx],
+        r = Rubble(151, 1e-3, 1e4, 3.5, Sigma_d[idx],
                    ranged_dist=[1e-3, 1e2],
-                   Sigma_g=Sigma_g[idx], H=H[idx], T=T[idx], alpha=alpha[idx], chi_MT=-0.1,
+                   Sigma_g=Sigma_g[idx], H=H[idx], T=T[idx], alpha=alpha[idx], u_f=u_f[u_idx],
                    Raccu=R_accu[idx], Z=0.01, Mdot=Mdot[idx], a_critD=a_critD[idx], a_max_in=100
                    )
 
         r.full_St_flag = True
         r.closed_box_flag = False
         r.run(200, 1, 1)
+
+        rd2compare = RubbleData("data2compare.dat")
+        rd = RubbleData("rubble_test.dat")
+        sigma_ratio = np.divide(rd2compare.sigma, rd.sigma, where=rd.sigma>0)
+        sigma_ratio[sigma_ratio == 0] = 1.0
+
+        assert(sigma_ratio.min() > 0.999)
+        assert(sigma_ratio.max() < 1.001)
+
+        rd.shrink_data("rubble_test_shrinked.dat", 2, keep_first_n=10)
+        rd_shrinked = RubbleData("rubble_test_shrinked.dat")
+
+        assert(rd_shrinked.t.size == 106)
+        assert(np.all(rd_shrinked.sigma[10] == rd.sigma[10]))
+        assert(np.all(rd_shrinked.sigma[11] == rd.sigma[12]))
 
         assert(1 > 0)
 

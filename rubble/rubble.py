@@ -1,10 +1,10 @@
 from astropy import units as u
 from astropy import constants as c
 import numpy as np
-import scipy as sp
 import scipy.integrate as spint
 import scipy.interpolate as spinterp
 import scipy.linalg as spla
+import scipy.special as spsp
 import logging
 import time
 import warnings
@@ -22,8 +22,8 @@ def rho_d_TL02(rho_d0, z, Hg, tau_s0, alpha, Sc=1.0):
 class Rubble:
     """ Simulate the local evolution of solid size distributions in Protoplanetary Disks (PPDs) """
 
+    # Making flags Descriptors so kernels can be updated when flags change
     class FlagProperty:
-        """ Making flags Descriptors so kernels can be updated when flags change """
 
         def __init__(self, name, doc_string=None):
             self.name = name
@@ -46,22 +46,27 @@ class Rubble:
             instance.flag_updated(self.name)
 
     # flags
-    debug_flag = FlagProperty("debug_flag", 
-    "whether or not to enable experimental features (default: False)")
+    debug_flag = FlagProperty("debug_flag",
+                              "whether or not to enable experimental features (default: False)")
     frag_flag = FlagProperty("frag_flag", 
-    "whether or not to calculate fragmentation (default: True)")
+                             "whether or not to calculate fragmentation (default: True)")
     mass_transfer_flag = FlagProperty("mass_transfer_flag",
-    "whether or not to include mass transfer as a fragmentation branch (default: True)")
+                                      "whether or not to include mass transfer as a fragmentation branch (default: "
+                                      "True)")
     bouncing_flag = FlagProperty("bouncing_flag", 
-    "whether or not to include bouncing (besides coagulation and fragmentation; default: True)")
+                                 "whether or not to include bouncing (besides coagulation and fragmentation; default: "
+                                 "True)")
     vel_dist_flag = FlagProperty("vel_dist_flag", 
-    "whether or not to consider velocity distribution in collisional outcome calculations (default: True)")
+                                 "whether or not to consider velocity distribution in collisional outcome "
+                                 "calculations (default: True)")
     closed_box_flag = FlagProperty("closed_box_flag", 
-    "whether or not to use a closed box (i.e., no solid loss or supply; default: True)")
+                                   "whether or not to use a closed box (i.e., no solid loss or supply; default: True)")
     simple_St_flag = FlagProperty("simple_St_flag", 
-    "whether or not to only use Epstein regime for Stokes number (i.e., ignore Stokes regime 1; default: False)")
+                                  "whether or not to only use Epstein regime for Stokes number (i.e., ignore Stokes "
+                                  "regime 1; default: False)")
     full_St_flag = FlagProperty("full_St_flag", 
-    "whether or not to include Stokes regime 3 & 4 for Stokes number (default: False => so Epstein & Stokes regime 1)")
+                                "whether or not to include Stokes regime 3 & 4 for Stokes number (default: False => "
+                                "so Epstein & Stokes regime 1)")
 
     def __init__(self, num_grid, amin, amax, q, Sigma_d, 
                  rho_m=1.6, run_name="rubble_test", **kwargs):
@@ -561,8 +566,8 @@ class Rubble:
         dv_TM[St_tiny] = Re ** (1 / 4) * abs(St_i[St_tiny] - St_j[St_tiny])
         # then, if the larger particle is in intermediate regime
         St_inter = ((St_i >= St_12) & (St_i < 1)) | ((St_j >= St_12) & (St_j < 1))
-        St_star12 = np.maximum(St_i[St_inter], St_j[St_inter]);
-        epsilon = St_i[St_inter] / St_j[St_inter];
+        St_star12 = np.maximum(St_i[St_inter], St_j[St_inter])
+        epsilon = St_i[St_inter] / St_j[St_inter]
         epsilon[epsilon > 1] = 1 / epsilon[epsilon > 1]
         dv_TM[St_inter] = np.sqrt(St_star12) * np.sqrt(
             (2 * 1.6 - (1 + epsilon) + 2 / (1 + epsilon) * (1 / (1 + 1.6) + epsilon ** 3 / (1.6 + epsilon))))
@@ -593,7 +598,7 @@ class Rubble:
         # first iteration, assume Re_d < 1 and then calculate St based on lambda_mpf
         if self.simple_St_flag:
             # only use Epstein regime
-            self.St_regimes = 1
+            self.St_regimes = np.ones_like(self.St)
             self.St = self.rho_m * self.a / self.Sigma_g * np.pi / 2
         else:
             # default: use Epstein regime + Stokes regime 1
@@ -669,22 +674,22 @@ class Rubble:
             # P(v|v_rms) = np.sqrt(54/np.pi) * v**2 / v_rms**3 * np.exp(-3/2 * (v / v_rms)**2)
             # the indefinite integral: 
             #     int_P(v) = -np.sqrt(54/np.pi)/3 * np.exp(-3/2 * (v/v_rms)**2) * (v/v_rms) 
-            #                + sp.special.erf(np.sqrt(1.5) * v/v_rms)
+            #                + spsp.erf(np.sqrt(1.5) * v/v_rms)
             # definite integral:
             #     int_P(v,{0,w}) = -np.sqrt(54/np.pi)/3 * np.exp(-3/2 * (w/v_rms)**2) * (w/v_rms) 
-            #                      + sp.special.erf(np.sqrt(1.5) * w/v_rms)
+            #                      + spsp.erf(np.sqrt(1.5) * w/v_rms)
             #     int_P(v,{w,infty}) = 1 + np.sqrt(54/np.pi)/3 * np.exp(-3/2 * (w/v_rms)**2) * (w/v_rms)
-            #                          - sp.special.erf(np.sqrt(1.5) * w/v_rms)
+            #                          - spsp.erf(np.sqrt(1.5) * w/v_rms)
             # 
             # we can now write down p_f and p_c
 
             p_f = (1 + np.sqrt(54/np.pi)/3 * np.exp(-3/2 * (u_f/self.dv)**2) * (u_f/self.dv) 
-                   - sp.special.erf(np.sqrt(1.5) * u_f/self.dv))
+                   - spsp.erf(np.sqrt(1.5) * u_f/self.dv))
 
             # we may try FURTHER and put a bouncing barrier in
             if self.bouncing_flag:
                 p_c = (-np.sqrt(54/np.pi)/3 * np.exp(-3/2 * (u_b/self.dv)**2) * (u_b/self.dv) 
-                       + sp.special.erf(np.sqrt(1.5) * u_b/self.dv))
+                       + spsp.erf(np.sqrt(1.5) * u_b/self.dv))
             else:
                 p_c = 1 - p_f
         else:
@@ -764,7 +769,7 @@ class Rubble:
         # now convert to vertically integrated kernel
         self.tM = self.M / self.vi_fac[:, :, np.newaxis]
 
-    def update_kernels(self):
+    def update_kernels(self, update_coeff=False):
         """ Update collisional kernels """
 
         # first, update disk parameters if needed in the future
@@ -777,9 +782,13 @@ class Rubble:
         self.h_ss_ij = self.H_d ** 2 + self.H_d[:, np.newaxis] ** 2
         self.vi_fac = np.sqrt(2 * np.pi * self.h_ss_ij)
 
-        # these coefficients usually only depend on the mass grid and need no change
-        # self.piecewise_coagulation_coeff()
-        # self.powerlaw_fragmentation_coeff()
+        if update_coeff:
+            # currently, no flag requires updateing coagulation coeff
+            # self.piecewise_coagulation_coeff()
+            self.gF = np.zeros([self.Ng+2, self.Ng+2, self.Ng+2])  # reset the gain coeff
+            self.lF = np.ones([self.Ng+2, self.Ng+2, self.Ng+2])   # reset the loss coeff
+            self.init_powerlaw_fragmentation_coeff()
+            self.powerlaw_fragmentation_coeff()
 
         # if needed, update the solid supply
         if not self.closed_box_flag:
@@ -791,12 +800,11 @@ class Rubble:
     def flag_updated(self, flag_name):
         """ Update flag sensitive kernels if needed whenever a flag changes """
 
-        # for flags that kernels do not depend on, we can skip this function
-        # if flag_name in ["spam_flag", "eggs_flag"]:
-        #     pass
-
         if self.flag_activated:
-            self.update_kernels()
+            if flag_name in ["mass_transfer_flag", ]:
+                self.update_kernels(update_coeff=True)
+            else:
+                self.update_kernels()
         else:
             # do not update kernel during the initial setup
             pass
@@ -861,7 +869,8 @@ class Rubble:
         
         a_critD = self.kwargs.get('a_critD', 0.01)   # critical dust size that will be lifted, in units of cm
 
-        Hratio_TL02 = np.zeros(512); St_TL02 = np.logspace(-10, 5, 512)
+        Hratio_TL02 = np.zeros(512)
+        St_TL02 = np.logspace(-10, 5, 512)
         with warnings.catch_warnings():
             warnings.filterwarnings('ignore', 'overflow encountered in exp')            
             for i in range(512):
@@ -1094,7 +1103,7 @@ class Rubble:
             else:
                 logger.setLevel(logging.INFO)
             logger.addHandler(fh)
-            self.log_func, self.warn_func, self.err_func = logger.info, logger.warn, logger.error
+            self.log_func, self.warn_func, self.err_func = logger.info, logger.warning, logger.error
         if dump == 'bin':
             dump_func = self.dump_bin_data  # recommended
         else:
@@ -1108,7 +1117,7 @@ class Rubble:
         else:
             self.log_func(f"===== Simulation begins now =====")
             dump_func(first_dump=True)
-            self.cycle_count = 0;
+            self.cycle_count = 0
             self.log_func(f"cycle={self.cycle_count}, t={self.t:.3e}, dt={dt:.3e}, rerr(Sigma_d)={self.rerr:.3e}")
             self.out_dt = out_dt
             dump_func()
@@ -1124,7 +1133,7 @@ class Rubble:
                 self.enforce_mass_con()
                 if not self.closed_box_flag:
                     self.update_solids(dt * self.s2y)
-                self.t += self.dt;
+                self.t += self.dt
                 self.cycle_count += 1
                 post_step_t = time.perf_counter()
                 self.log_func(f"cycle={self.cycle_count}, t={self.t:.3e}yr, dt={self.dt:.3e}, "
@@ -1148,7 +1157,7 @@ class Rubble:
                 self.enforce_mass_con()
                 if not self.closed_box_flag:
                     self.update_solids(tmp_dt * self.s2y)
-                self.t += self.dt;
+                self.t += self.dt
                 self.cycle_count += 1
                 post_step_t = time.perf_counter()
                 self.log_func(f"cycle={self.cycle_count}, t={self.t:.3e}yr, dt={self.dt:.3e}, "
@@ -1166,7 +1175,7 @@ class Rubble:
             self.enforce_mass_con()
             if not self.closed_box_flag:
                 self.update_solids(dt * self.s2y)
-            self.t += self.dt;
+            self.t += self.dt
             self.cycle_count += 1
             post_step_t = time.perf_counter()
             self.log_func(f"cycle={self.cycle_count}, t={self.t:.3e}yr, dt={self.dt:.3e}, "
