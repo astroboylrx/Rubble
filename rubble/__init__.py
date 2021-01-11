@@ -9,7 +9,7 @@
     This package also includes various functions that can be used to analyze and visualize results produced by Rubble.
 """
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 __author__ = "Rixin Li"
 __email__ = "rixinli.astro@gmail.com"
 __all__ = ["help_info", "Rubble", "RubbleData"]
@@ -36,7 +36,7 @@ def help_info():
     * analyze and visualize results produced by Rubble.
     * 
     * Author: Rixin Li
-    * Current Version: 0.1.1
+    * Current Version: 0.1.2
     * Note: This package is still under active development and we welcome
     *       any comments and suggestions.
     **************************************************************************
