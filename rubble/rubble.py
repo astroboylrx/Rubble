@@ -1,6 +1,7 @@
 from astropy import units as u
 from astropy import constants as c
 import numpy as np
+import scipy.optimize as spopt
 import scipy.integrate as spint
 import scipy.interpolate as spinterp
 import scipy.linalg as spla
@@ -61,12 +62,24 @@ class Rubble:
                                  "calculations (default: True)")
     closed_box_flag = FlagProperty("closed_box_flag", 
                                    "whether or not to use a closed box (i.e., no solid loss or supply; default: True)")
+    dyn_env_flag = FlagProperty("dyn_env_flag",
+                                "whether or not to consider dynamic dust exchange with the environment "
+                                "(i.e., varying Mdot, so call init_update_solids each time; default: False)")
     simple_St_flag = FlagProperty("simple_St_flag", 
                                   "whether or not to only use Epstein regime for Stokes number (i.e., ignore Stokes "
                                   "regime 1; default: False)")
     full_St_flag = FlagProperty("full_St_flag", 
                                 "whether or not to include Stokes regime 3 & 4 for Stokes number (default: False => "
                                 "so Epstein & Stokes regime 1)")
+    f_mod_flag = FlagProperty("f_mod_flag",
+                              "whether or not to use a modulation factor to limit the coagulation with mass bins with "
+                              "< 1 particle numbers (e.g., over an 0.1 AU wide annulus at 1 AU; default: False)")
+    uni_gz_flag = FlagProperty("uni_gz_flag",
+                               "whether or not to use unidirectional ghost zones (so the left gz also coagulate "
+                               "and the right one fragment; default: False => masses sink to inactive ghost zones)")
+    feedback_flag = FlagProperty("feedback_flag",
+                                 "whether or not to consider the feedback (i.e., back reaction) of solids, so that "
+                                 "diffusion coefficients will be damped with (1+eps)^{-K}, reducing H_d and dv_ij")
 
     def __init__(self, num_grid, amin, amax, q, Sigma_d, 
                  rho_m=1.6, run_name="rubble_test", **kwargs):
@@ -126,11 +139,11 @@ class Rubble:
         Notes
         -----
         1. The results of solving the Smoluchowski equation are known to depend on resolution, initial setup,
-        and the length of time step.  Be sure to test different setups and find the converging behaviors.
+        and the length of time step (and also the Python environment and the machine used).  Be sure to test
+        different setups and find the converging behaviors.
 
         2. One instance of Rubble is designed to run one physical simulation with one set of parameters.
-        Restarting the same simulation is supported, and in the future Rubble will be able to simulate more physical
-        ingredients.
+        Restarting the same simulation is only partially supported.
 
         """
 
@@ -164,6 +177,9 @@ class Rubble:
         self.cgs_k_B = c.k_B.to(u.g*u.cm**2/u.s**2/u.K).value  # k_B in cgs units
         self.cgs_mu = 2.3 * c.m_p.to(u.g).value                # mean molecular weigth * proton mass (sometimes 2.34)
         self.sigma_H2 = 2.0e-15                                # cm^2, cross section for H2 (may fail when T < 70K)
+        self.sqrt_2_pi = np.sqrt(2 * np.pi)
+        self.S_annulus = 2*np.pi*1.0*0.1 * (u.au.to(u.cm))**2  # surface an 0.1 AU wide annulus at 1 AU
+        self.feedback_K = 1                                    # 1/(1 + <eps>)^{...} when inc. feedback effects
         self.kwargs = kwargs
         self.init_disk_parameters()                            # extract disk parameters from self.kwargs
 
@@ -178,8 +194,11 @@ class Rubble:
         self.St_12 = 0                      # particles below this are tightly-coupled
         self.St_regimes = np.zeros(Ng+2)    # St regimes (1: Epstein; 2: Stokes, Re<1; 3: 1<Re<800; 4: Re>800)
         self.H_d = np.zeros(Ng+2)           # dust scale height
+        self.eps = np.zeros(Ng+2)           # midplane dust-to-gas density ratio
+        self.eps_tot = 0.01                 # total midplane dust-to-gas density ratio
+        self.FB_eps_cap = 100               # max eps to cap the feedback effects
         self.Re_d = np.zeros(Ng+2)          # Reynolds-number Re = 2 a u / nu_mol
-        self.Hratio_TL02_loss = None        # function to calculate solid loss fraction due to accretion flow
+        self.Hratio_loss = None             # function to calculate solid loss fraction due to accretion flow
 
         # basic matrixes used in simulation; following the subscript, use i as the highest dimension, j second, k third,
         # meaning the changes due to i happens along the axis=0, changes due to j on axis=1, due to k on axis=2
@@ -218,7 +237,9 @@ class Rubble:
         self.p_f = np.zeros([self.Ng+2, self.Ng+2])            # the fragmentation probability
         self.K = np.zeros([self.Ng+2, self.Ng+2])              # the coagulation kernel
         self.L = np.zeros([self.Ng+2, self.Ng+2])              # the fragmentation kernel
+        self.f_mod = np.zeros([self.Ng+2, self.Ng+2])          # the modulation factor to disable bins with tiny Nk
 
+        # TODO: it is possible to save RAM cost by eliminating M1-M4, e.g., just use M and add to tM step by step
         self.C = np.zeros([self.Ng+2, self.Ng+2, self.Ng+2])   # the epsilon matrix to distribute coagulation mass
         self.gF = np.zeros([self.Ng+2, self.Ng+2, self.Ng+2])  # the gain coeff of power-law dist. of fragments
         self.lF = np.ones([self.Ng+2, self.Ng+2, self.Ng+2])   # the loss coeff of power-law dist. of fragments
@@ -245,7 +266,12 @@ class Rubble:
         self.res4out = np.zeros([1+(self.Ng+2)*2])             # results for output, [t, sigma, Nk] for now
         self.rerr_th = self.kwargs.get('rerr_th', 1e-6)        # threshold for relative error to issue warnings
         self.rerr_th4dt = self.kwargs.get('rerr_th4dt', 1e-6)  # threshold for relative error to lower timestep
-        self.negloop_tol = self.kwargs.get('negloop_tol', 20)  # max. No. of loops to reduce dt to avoid negative values
+        self.neg2o_th = self.kwargs.get('neg2o_th', 1e-15)     # threshold (w.r.t. Sigma_d) for reset negative Nk to 0
+        self.negloop_tol = self.kwargs.get('negloop_tol', 20)  # max. No. of loops to reduce dt to avoid negative Nk
+        self.dynamic_dt = False                                # whether or not to use a larger desired dt; set by run()
+        self.dyn_dt = self.kwargs.get('dyn_dt', 1)             # desired dt (only used if it speeds up runs)
+        self.tol_dyndt = self.kwargs.get('tol_dyndt', 1e-7)    # tolerance for relative error to use larger dynamic dt
+        self.dyn_dt_success = False                            # if previous dynamic dt succeed, then continue using it
 
         self.log_func = print                                  # function to write log info
         self.warn_func = print                                 # function to write warning info
@@ -257,6 +283,7 @@ class Rubble:
         self.log_file_name = run_name + ".log"                 # filename for writing logs
 
         # flags
+        self.static_kernel_flag = self.kwargs.get('static_kernel', True)  # assuming kernel to be static
         self.flag_activated = False                            # simply set flag values and skip flag_updated()
         self._flag_dict = {}                                   # an internal flag dict for bookkeeping
         self.debug_flag = self.kwargs.get('debug', False)      # whether or not to enable experimental features
@@ -265,20 +292,26 @@ class Rubble:
         self.bouncing_flag = self.kwargs.get('bouncing', True) # ..................include bouncing
         self.vel_dist_flag = self.kwargs.get('VD', True)       # ..................include velocity distribution
         self.closed_box_flag = self.kwargs.get('CB', True)     # ..................use a closed box (so no loss/supply)
+        self.dyn_env_flag = self.kwargs.get('dyn_env', False)  # ..................consider dynamic loss/supply
         self.simple_St_flag = self.kwargs.get('simSt', False)  # ..................use only Epstein regime for St
         self.full_St_flag = self.kwargs.get('fullSt', False)   # ..................use full four regimes for St
-        self.flag_activated = True
-        self.static_kernel_flag = self.kwargs.get('static_kernel', True)  # assuming kernel to be static
+        self.f_mod_flag = self.kwargs.get('f_mod', False)      # ..................use f_mod for coagulation
+        self.uni_gz_flag = self.kwargs.get('uni_gz', False)    # ..................use unidirectional ghost zones
+        self.feedback_flag = False                             # ..................inc. solid feedback to alpha_D
 
         # run preparation functions
         self.init_powerlaw_fragmentation_coeff()               # extract frag-related parameters from self.kwargs
         self.piecewise_coagulation_coeff()                     # based on mass grid, no dependence on other things
         self.powerlaw_fragmentation_coeff()                    # based on mass grid, no dependence on other things
         self.distribute_solids()                               # initial setup: distribute solids to each size/mass bins
-        self.update_kernels()                                  # the kernel is static if gas disk remains static
-        
         if not self.closed_box_flag:
-            self.init_update_solids()                          # initialize accretion part, based on Mdot, Raccu, H, Z
+            self.init_update_solids()  # initialize accretion part, based on Mdot, Raccu, H, Z
+            # this will update self.S_annulus, which will be used in self.update_kernels
+
+        self.update_kernels()                                  # the kernel is static if gas disk remains static
+
+        self.flag_activated = True  # some flags may change static_kernel_flag
+        self.feedback_flag = self.kwargs.get('FB', False)      # some flags require initialization of H_d, St, eps
 
     def __reset(self):
         """ Reset most internal data with zero-filling
@@ -293,13 +326,13 @@ class Rubble:
 
         self.Sigma_g = self.kwargs.get('Sigma_g', self.Sigma_d*100)  # total gas surface density, in units of g/cm^2
         self.Sigma_dot = 0.0                                         # accretion rate on the surface density
-        self.alpha = self.kwargs.get('alpha', 1e-3)                  # alpha description
+        self.alpha = self.kwargs.get('alpha', 1e-3)                  # alpha-prescription, may != diffusion coeff
         self.T = self.kwargs.get('T', 280)                           # temperature, in units of K
         self.Omega = 5.631352229752323e-07                           # Keplerian orbital frequency, 1/s (0.5 AU, 1 Msun)
         self.H = self.kwargs.get('H', 178010309011.3974)             # gas scale height, cm (2.088e11 if with gamma=1.4)
-        
+
         # derive more
-        self.rho_g0 = self.Sigma_g / (np.sqrt(2 * np.pi) * self.H)   # midplane gas density
+        self.rho_g0 = self.Sigma_g / (self.sqrt_2_pi * self.H)       # midplane gas density
         self.lambda_mpf = 1 / (self.rho_g0 / self.cgs_mu * self.sigma_H2)  # mean free path of the gas, in units of cm
         self.c_s = (self.cgs_k_B * self.T / self.cgs_mu) ** 0.5      # gas sound speed, cm/s (1.1861e5 if gamma=1.4)
         self.nu_mol = 0.5 * np.sqrt(8 / np.pi) * self.c_s * self.lambda_mpf  # molecular viscosity
@@ -331,6 +364,15 @@ class Rubble:
             tmp_sigma[a_idx_i:a_idx_f + 1] = self.a[a_idx_i:a_idx_f + 1] ** (-self.s)
             C_norm = self.Sigma_d / np.sum(tmp_sigma * self.dlog_a)
             self.sigma = tmp_sigma * C_norm
+        elif 'input_dist' in self.kwargs:
+            try:
+                self.sigma = self.kwargs['input_dist']
+                self.Sigma_d = self.get_Sigma_d(self.sigma / (3 * self.m))
+            except Exception as e:
+                self.warn_func("fail to take the input distribution, revert back to default. "+e.__str__())
+                tmp_sigma = self.a[1:-1] ** (-self.s)
+                C_norm = self.Sigma_d / np.sum(tmp_sigma * self.dlog_a)
+                self.sigma[1:-1] = tmp_sigma * C_norm
         else:
             tmp_sigma = self.a[1:-1] ** (-self.s)
             C_norm = self.Sigma_d / np.sum(tmp_sigma * self.dlog_a)
@@ -422,22 +464,25 @@ class Rubble:
                             + f"transfer is 100% in units of the projectile mass.  To make it physical, chi_MT has "
                             + f"been reduced to 0.99")
                 self.chi_MT = -0.99
-            if self.mratio_MT < 25:
+            if self.mratio_MT < 20:
                 self.warn_func(f"The minimum mass ratio for full mass transfer effects (mratio_MT = {self.mratio_MT}) "
-                               + f"is smaller than 25. Mass transfer is more likely to happen when the mass difference"
-                               + f" is larger. mratio_MT has been changed to 25.")
+                               + f"is smaller than 20. Mass transfer is more likely to happen when the mass difference"
+                               + f" is larger. Be careful here.")
+                if self.mratio_MT < 1:
+                    raise ValueError(f"The minimum mass ratio for full mass transfer effects (mratio_MT = {self.mratio_MT}) "
+                                     + f"is smaller than 1. Please use a larger and reasonable value.")
             if self.mratio_cratering > self.mratio_MT:
                 self.warn_func(f"Mass ratio for cratering to take place (mratio_cratering = {self.mratio_cratering}) "
                                + f"is larger than the minimum mass ratio for full mass transfer effects "
                                + f"(mratio_MT = {self.mratio_MT}).  mratio_cratering has been changed to "
-                               + f"mratio_MT - 15.")
-                self.mratio_cratering = self.mratio_MT - 15
+                               + f"mratio_MT - 10.")
+                self.mratio_cratering = max(1, self.mratio_MT - 10)
             if self.mratio_c2MT > self.mratio_MT:
                 self.warn_func(f"Mass ratio to begin transition from cratering to mass transfer (mratio_c2MT = "
                                + f"{self.mratio_c2MT}) is smaller than the minimum mass ratio for cratering to happen "
                                + f"(mratio_MT = {self.mratio_MT}).  mratio_c2MT has been changed to "
-                               + f"mratio_MT - 10.")
-                self.mratio_c2MT = self.mratio_MT - 10
+                               + f"mratio_MT - 5.")
+                self.mratio_c2MT = max(1, self.mratio_MT - 5)
             if self.mratio_c2MT < self.mratio_cratering:
                 self.warn_func(f"Mass ratio to begin transition from cratering to mass transfer (mratio_c2MT = "
                                + f"{self.mratio_c2MT}) is larger than the minimum mass ratio for full mass transfer "
@@ -457,22 +502,20 @@ class Rubble:
         """
         
         C_norm = np.zeros(self.Ng+2)
-        tmp_Nk = np.tril(self.m_j**(-self.xi + 1), -1)                   # fragments of i into j (= i-1, ..., 1)
-        C_norm[1:] = self.m[1:] / np.sum(tmp_Nk * self.m_j, axis=1)[1:]
+        tmp_Nk = np.tril(self.m_j**(-self.xi + 1), -1)                   # fragments of i into j (= i-1, ..., 0)
+        C_norm[1:] = self.m[1:] / np.sum(tmp_Nk * self.m_j, axis=1)[1:]  # this only skip the first row, still i-1 to 0
         
         if False:
-            """ Below are a few alternate options to distribute fragments but involve ghost zones (not recommended) """
+            """ Below are a few alternate options to distribute fragments """
             # A. this one somehow slows the program dramatically!!!
             tmp_Nk = np.tril(self.m_j**(-self.xi+1))                     # fragments of i into j (= i, ..., 0)
             C_norm = self.m / np.sum(tmp_Nk * self.m_j, axis=1)
             # B. this one also slows the program dramatically!!!
             tmp_Nk = np.tril(self.m_j**(-self.xi+1))                     # fragments of i into j (= i, ..., 1)
-            C_norm[1:] = self.m[1:] / np.sum(tmp_Nk * self.m_j, axis=1)[1:]
-            # C. this one slows down the program somewhat
-            tmp_Nk = np.tril(self.m_j**(-self.xi+1), -1)                 # fragments of i into j (= i-1, ..., 0)
-            C_norm = self.m / np.sum(tmp_Nk * self.m_j, axis=1)
+            C_norm[1:] = self.m[1:] / np.sum(tmp_Nk[:, 1:] * self.m_j[:, 1:], axis=1)[1:]
+            tmp_Nk[:, 0] = 0
         
-        frag_Nk = tmp_Nk * C_norm[:, np.newaxis]                         # how unit mass will be distributed
+        frag_Nk = tmp_Nk * C_norm[:, np.newaxis]                         # how unit mass at i will be distributed to j
         
         # copy to local variables for simplicity and improve readability
         chi, chi_MT = self.chi, self.chi_MT
@@ -576,9 +619,16 @@ class Rubble:
         dv_TM[St_large] = np.sqrt(1 / (1 + St_i[St_large]) + 1 / (1 + St_j[St_large]))
 
         if self.kwargs.get("W12_VD", False):
-            # for debug use for now, simply the turbulent relative velocities to two regimes
-            # for both particles with St < 1, use the formula below
+            # for debug use for now, simplify the turbulent relative velocities to two regimes
+            # for both particles with St < 1, use the formula below (from Windmark+2012b)
             dv_TM[~St_large] = np.sqrt(np.maximum(St_i[~St_large], St_j[~St_large]) * 3.0)
+
+        if self.feedback_flag:
+            # reduce the turbulent relative velocities by the weighted midplane dust-to-gas density ratio
+            # effectively, using alpha_D = alpha / (1 + <eps>)^K, and K defaults to 1
+            # N.B., H_d are initialized to zeros, so this flag must be False in the first call
+            u_gas_TM *= 1 / np.sqrt(min(self.FB_eps_cap, (1 +
+                (self.sigma/self.H_d).sum()/self.sqrt_2_pi*self.dlog_a / self.rho_g0)**self.feedback_K))
 
         self.dv_TM = dv_TM * u_gas_TM
         # print(f"u_gas_TM={u_gas_TM:.3e}, St_12={St_12:.3e}, Re={Re:.3e}")
@@ -605,7 +655,7 @@ class Rubble:
             self.St_regimes[self.a < self.lambda_mpf * 9 / 4] = 1
             self.St_regimes[self.a >= self.lambda_mpf * 9 / 4] = 2
             self.St[self.St_regimes == 1] = (self.rho_m * self.a / self.Sigma_g * np.pi / 2)[self.St_regimes == 1]
-            self.St[self.St_regimes == 2] = (np.sqrt(2 * np.pi) / 9 * (self.rho_m * self.sigma_H2 * self.a ** 2) 
+            self.St[self.St_regimes == 2] = (self.sqrt_2_pi / 9 * (self.rho_m * self.sigma_H2 * self.a ** 2)
                                             / self.cgs_mu / self.H)[self.St_regimes == 2]
         
         self.calculate_dv()
@@ -705,43 +755,86 @@ class Rubble:
                 p_c[self.dv < u_b] = 1.0
             else:
                 p_c = 1 - p_f
-        
-        # set the probabilities to zero for any p_{ij} that involves m_0 and m_last (i.e., in ghost zones)
-        self.p_f.fill(0)
-        self.p_f[1:-1, 1:-1] = p_f[1:-1, 1:-1]
-        self.p_c.fill(0)
-        self.p_c[1:-1, 1:-1] = p_c[1:-1, 1:-1]
-        self.p_b.fill(0)
-        self.p_b[1:-1, 1:-1] = (1 - self.p_f - self.p_c)[1:-1, 1:-1]
 
-        if False:
-            # the following two line is whether or not to distribute fragments to themselves 
-            # and all the way to ghost zone => NEED TO BE USED WITH CORRECT tmp_Nk AND C_norm
-            self.p_f = np.copy(p_f)
-            self.p_c = np.copy(p_c)
+        if self.uni_gz_flag == True:
+            # unidirectional ghost zones, where the left one also coagulate and the right one also fragment
+            self.p_f.fill(0)
+            self.p_f[1:, 1:] = p_f[1:, 1:]
+            self.p_c.fill(0)
+            self.p_c[:-1, :-1] = p_c[:-1, :-1]
+            self.p_b.fill(0)
+            self.p_b = (1 - self.p_f - self.p_c)
+        elif self.uni_gz_flag == False:
+            # set the probabilities to zero for any p_{ij} that involves m_0 and m_last (i.e., inactive ghost zones)
+            self.p_f.fill(0)
+            self.p_f[1:-1, 1:-1] = p_f[1:-1, 1:-1]
+            self.p_c.fill(0)
+            self.p_c[1:-1, 1:-1] = p_c[1:-1, 1:-1]
+            self.p_b.fill(0)
+            self.p_b[1:-1, 1:-1] = (1 - self.p_f - self.p_c)[1:-1, 1:-1]
+        elif self.uni_gz_flag == 2:
+            # set the probabilities to zero for any p_{ij} that involves m_last (i.e., active left + inactive right)
+            self.p_f.fill(0)
+            self.p_f[1:-1, 1:-1] = p_f[1:-1, 1:-1]
+            self.p_c.fill(0)
+            self.p_c[:-1, :-1] = p_c[:-1, :-1]
+            self.p_b.fill(0)
+            self.p_b[:-1, :-1] = (1 - self.p_f - self.p_c)[:-1, :-1]
+        elif self.uni_gz_flag == 3:
+            # set the probabilities to zero for any p_{ij} that involves m_0 (i.e., inactive left + active right)
+            self.p_f.fill(0)
+            self.p_f[1:, 1:] = p_f[1:, 1:]
+            self.p_c.fill(0)
+            self.p_c[1:-1, 1:-1] = p_c[1:-1, 1:-1]
+            self.p_b.fill(0)
+            self.p_b[1:, 1:] = (1 - self.p_f - self.p_c)[1:, 1:]
+        elif self.uni_gz_flag == 4:
+            # fully active ghost zones
+            self.p_f.fill(0)
+            self.p_f = p_f
+            self.p_f[0, 0] = 0
+            self.p_c.fill(0)
+            self.p_c = p_c
+            self.p_c[-1, -1] = 0
+            self.p_b = 1 - self.p_f - self.p_c
+        else:
+            raise ValueError(f"uni_gz_flag must be one of: True (both gz active), False (both gz inactive), "
+                             f"2 (active left gz + inactive right gz), or 3 (inactive left gz + active right gz).")
         
         # Note: since K is symmetric, K.T = K, and dot(K_{ik}, n_i) = dot(K_{ki}, n_i) = dot(n_i, K_{ik})
         self.kernel = self.dv * self.geo_cs     # general kernel = du_ij * geo_cs
         self.L = self.kernel * self.p_f         # frag kernel, L_ij
         self.K = self.kernel * self.p_c         # coag kernel, K_ij
+
+        if self.f_mod_flag is True:
+            # use the modulation function to limit the interactions between mass bins that have low particle numbers
+            with warnings.catch_warnings():
+                warnings.filterwarnings('ignore', '', RuntimeWarning)
+                tmp_Nk = self.Nk * self.S_annulus
+                self.f_mod = np.exp(-1 / tmp_Nk[:, np.newaxis] - 1 / tmp_Nk)
+                # modify K and L directly since they'll be re-generated each time
+                self.K = self.K * self.f_mod
+                self.L = self.L * self.f_mod
         
-        # RL new notes: b/c Q_ij = K_ij N_i N_j gives "the number of collisions per second between two particle species"
-        # when we consider the number loss of N_i collide N_i, the # of collision events reduces to Q_ij / 4.
-        # However, two particles are needed per event, so the number loss is Q_ij / 2
+        """
+        RL new notes: b/c Q_ij = K_ij N_i N_j gives "the number of collisions per second between two particle species"
+        when we consider the number loss of N_i collide N_i, the # of collision events reduces to Q_ij / 4.
+        However, two particles are needed per event, so the number loss is Q_ij / 2
         
-        # we divide M_ijk into four parts as in Eq. 36 in Birnstiel+2010, below is the first term
-        ## we need to make all parts of M_ijk as 3D matrixes, for later convenience in implicit step
-        ## all the parts can be further calculated by self.Nk.dot(self.Nk.dot(M)) to reduce the j and then the i axis
-        ## PS: check out the doc of np.dot at https://numpy.org/doc/stable/reference/generated/numpy.dot.html
-        ##                                   ****************
-        ## N.B., vec.dot(ndarray) reduces the SECOND-TO-LAST axis dimension of ndarray
-        ##                                   ****************
-        ## e.g., dot(a, b)[i,j,k,m] = sum(a[i,j,:] * b[k,:,m]), or dot(a, b)[k,m] = sum(a[:] * b[k,:,m])
-        ## b/c numpy treat the last two axis of b as a matrix, any higher dimensions are stacks of matrixes
-        ## you may try: M = np.arange(27).reshape([3, 3, 3]); v = np.array([0.5, 1.5, 2.5]); print(v.dot(M))
-        ## 
-        ## Alternatively, we can use np.tensordot(Nk, M, (0, 1)), which is equiv to Nk.dot(M)
-        ## but np.tensordot provides the possibility of computing dot product along specified axes
+        we divide M_ijk into four parts as in Eq. 36 in Birnstiel+2010, below is the first term
+        | we need to make all parts of M_ijk as 3D matrixes, for later convenience in implicit step
+        | all the parts can be further calculated by self.Nk.dot(self.Nk.dot(M)) to reduce the j and then the i axis
+        | PS: check out the doc of np.dot at https://numpy.org/doc/stable/reference/generated/numpy.dot.html
+        |                                   ****************
+        | N.B., vec.dot(ndarray) reduces the SECOND-TO-LAST axis dimension of ndarray
+        |                                   ****************
+        | e.g., dot(a, b)[i,j,k,m] = sum(a[i,j,:] * b[k,:,m]), or dot(a, b)[k,m] = sum(a[:] * b[k,:,m])
+        | b/c numpy treat the last two axis of b as a matrix, any higher dimensions are stacks of matrixes
+        | you may try: M = np.arange(27).reshape([3, 3, 3]); v = np.array([0.5, 1.5, 2.5]); print(v.dot(M))
+        | 
+        | Alternatively, we can use np.tensordot(Nk, M, (0, 1)), which is equiv to Nk.dot(M)
+        | but np.tensordot provides the possibility of computing dot product along specified axes
+        """
         
         self.M1 = 0.5 * self.C * self.K[:, :, np.newaxis]       # multiply C and K with matching i and j
         self.M1[self.idx_ij_same] *= 0.5                        # less collision events in single particle species
@@ -772,13 +865,110 @@ class Rubble:
     def update_kernels(self, update_coeff=False):
         """ Update collisional kernels """
 
+        if self.f_mod_flag is True and self.feedback_flag is False and self.cycle_count > 0:
+            # use the modulation function to limit the interactions between mass bins that have low particle numbers
+            # if w/o feedback effects, we don't need to go through the entire update_kernels procedure, only new f_mod
+            # and new tM are needed. Thus, we squeeze them here
+            if self.cycle_count == 1:
+                # Previously, self.K/L has been over-written with *= self.f_mod. We need to re-generate them when going
+                # into this branch for the first time
+                self.L = self.kernel * self.p_f
+                self.K = self.kernel * self.p_c
+            with warnings.catch_warnings():
+                warnings.filterwarnings('ignore', '', RuntimeWarning)
+                tmp_Nk = self.Nk * self.S_annulus
+                self.f_mod = np.exp(-1 / tmp_Nk[:, np.newaxis] - 1 / tmp_Nk)
+            # for f_mod only, we cannot just modify K/L since they won't be re-generated
+            tmp_K = self.K * self.f_mod
+            tmp_L = self.L * self.f_mod
+
+            self.M1 = 0.5 * self.C * tmp_K[:, :, np.newaxis]  # multiply C and K with matching i and j
+            self.M1[self.idx_ij_same] *= 0.5  # less collision events in single particle species
+            self.M2 = tmp_K[:, :, np.newaxis] * self.ones3D
+            self.M2[self.idx_jk_diff] = 0.0  # b/c M2 has a factor of delta(j-k)
+            self.M2[self.idx_ij_same] *= 0.5  # less collision events in single particle species
+
+            if self.frag_flag:
+                self.M3 = 0.5 * tmp_L[:, :, np.newaxis] * self.gF  # multiply gF and L with matching i and j
+                self.M4 = tmp_L[:, :, np.newaxis] * self.lF  # multiply lF and L with matching i and j
+            else:
+                self.M3.fill(0)
+                self.M4.fill(0)
+
+            self.M = self.M1 - self.M2 + self.M3 - self.M4
+            # now convert to vertically integrated kernel
+            self.tM = self.M / self.vi_fac[:, :, np.newaxis]
+            return None
+
         # first, update disk parameters if needed in the future
         # self._update_disk_parameters()
 
         # then, calculate solid properties
         self.calculate_St()
 
-        self.H_d = self.H * np.minimum(1, np.sqrt(self.alpha / (np.minimum(self.St, 0.5) * (1 + self.St ** 2))))
+        if self.feedback_flag:
+            # make a closer guess on the total midplane dust-to-gas density ratio
+            self.H_d = self.H / np.sqrt(1 + self.St / self.alpha
+                                        * min(self.FB_eps_cap, (1 + self.eps.sum())**self.feedback_K))
+            self.eps = self.sigma * self.dlog_a / self.sqrt_2_pi / self.H_d / self.rho_g0
+            self.eps_tot = self.eps.sum()
+            self.calculate_St()
+            # use root finding to self-consistently calculate the weighted midplane dust-to-gas ratio
+            self._root_finding_tmp = self.sigma * self.dlog_a / self.sqrt_2_pi / self.rho_g0 / self.H
+
+            """
+            N.B.: in fact St also depends on eps through dv, but we assume St won't change too much (especially for
+            particles with small St) and solve for eps that makes H_d and eps self-consistent.
+            
+            One caveat when eps_tot>>1 though: each time update_kernels() is called, St in the high mass tail varies,
+            leading to *slightly* different St, dv, and thus *slightly* different kernels (K varies more, L less)
+            """
+            try:
+                with warnings.catch_warnings():
+                    warnings.filterwarnings('ignore')
+                    tmp_sln = spopt.root_scalar(lambda et : et
+                        - np.sum(self._root_finding_tmp * (1 + self.St / self.alpha
+                                                           * min(self.FB_eps_cap, (1 + et)**self.feedback_K))**0.5),
+                                            x0 = self.eps_tot, x1 = self.eps_tot*5,
+                                            method='brentq', bracket=[min(self.FB_eps_cap*0.9, self.eps_tot/5),
+                                                                      self.eps_tot*100])
+                    if tmp_sln.converged and np.isfinite(tmp_sln.root):
+                        self.H_d = self.H / np.sqrt(1 + self.St / self.alpha
+                                                    * min(self.FB_eps_cap, (1 + tmp_sln.root)**self.feedback_K))
+                        self.eps = self.sigma * self.dlog_a / self.sqrt_2_pi / self.H_d / self.rho_g0
+                        self.eps_tot = self.eps.sum()
+                        self.calculate_St()
+                    else:
+                        raise RuntimeError("solution not converged")
+            except Exception as e:
+                self.warn_func("Root finding for the total midplane dust-to-gas density ratio failed. "
+                               + "\nError message: " + e.__str__()
+                               + "\nFall back to use five iterations.")
+                for idx_fb in range(4):
+                    # if eps.sum() is already larger than the desired capped value, skip
+                    #if (1 + self.eps.sum())**self.feedback_K > self.FB_eps_cap:
+                    #    break
+                    # on a second thought, even if eps.sum() > cap, one more loop is needed to make H_d consistent
+                    # manually finding closer solution
+                    self.H_d = self.H / np.sqrt(1 + self.St / self.alpha
+                                                * min(self.FB_eps_cap, (1 + self.eps.sum())**self.feedback_K))
+                    self.eps = self.sigma * self.dlog_a / self.sqrt_2_pi / self.H_d / self.rho_g0
+                    self.eps_tot = self.eps.sum()
+                    self.calculate_St()
+        else:
+            # using Eq. 28 in Youdin & Lithwick 2007, ignore the factor: np.sqrt((1 + self.St) / (1 + 2*self.St))
+            self.H_d = self.H / np.sqrt(1 + self.St / self.alpha)
+            # the ignored factor may further reduce H_d and lead to a larger solution to midplane eps_tot
+            self.eps = self.sigma * self.dlog_a / self.sqrt_2_pi / self.H_d / self.rho_g0
+            self.eps_tot = self.eps.sum()
+
+        if self.kwargs.get("B10_Hd", False):
+            # for debug use only, calculate the solid scale height based on Eq. 51 in Birnstiel+2010
+            # this formula mainly focuses on smaller particles and results in super small H_d for St >> 1
+            # which may be improved by adding limits from the consideration of KH effects
+            self.H_d = self.H * np.minimum(1, np.sqrt(self.alpha / (np.minimum(self.St, 0.5) * (1 + self.St ** 2))))
+            self.eps = self.sigma * self.dlog_a / self.sqrt_2_pi / self.H_d / self.rho_g0
+
         self.h_ss_ij = self.H_d ** 2 + self.H_d[:, np.newaxis] ** 2
         self.vi_fac = np.sqrt(2 * np.pi * self.h_ss_ij)
 
@@ -790,8 +980,8 @@ class Rubble:
             self.init_powerlaw_fragmentation_coeff()
             self.powerlaw_fragmentation_coeff()
 
-        # if needed, update the solid supply
-        if not self.closed_box_flag:
+        # if needed, update how solid loss/supply should be calculated
+        if self.dyn_env_flag:
             self.init_update_solids()
 
         # finally, re-evaluate kernels
@@ -801,6 +991,15 @@ class Rubble:
         """ Update flag sensitive kernels if needed whenever a flag changes """
 
         if self.flag_activated:
+            if flag_name in ["f_mod_flag", "feedback_flag"]:
+                if self.f_mod_flag is True or self.feedback_flag is True:
+                    self.static_kernel_flag = False
+                else:
+                    self.static_kernel_flag = True
+            if flag_name in ["closed_box_flag", ]:
+                if self.closed_box_flag is False:
+                    self.init_update_solids()
+
             if flag_name in ["mass_transfer_flag", ]:
                 self.update_kernels(update_coeff=True)
             else:
@@ -809,6 +1008,24 @@ class Rubble:
             # do not update kernel during the initial setup
             pass
 
+    def show_flags(self):
+        """ print all the flags to show status """
+
+        print(f"{'frag_flag:':32}", self.frag_flag)
+        print(f"{'bouncing_flag:':32}", self.bouncing_flag)
+        print(f"{'mass_transfer_flag:':32}", self.mass_transfer_flag)
+        print(f"{'f_mod_flag:':32}", self.f_mod_flag)
+        print(f"{'vel_dist_flag:':32}", self.vel_dist_flag)
+        print(f"{'simple_St_flag:':32}", self.simple_St_flag)
+        print(f"{'full_St_flag:':32}", self.full_St_flag)
+        print(f"{'feedback_flag:':32}", self.feedback_flag)
+        print(f"{'uni_gz_flag:':32}", self.uni_gz_flag)
+        print(f"{'closed_box_flag:':32}", self.closed_box_flag)
+        print(f"{'dyn_env_flag:':32}", self.dyn_env_flag)
+        print(f"{'static_kernel_flag:':32}", self.static_kernel_flag)
+        print(f"{'debug_flag:':32}", self.debug_flag)
+        print(f"{'flag_activated:':32}", self.flag_activated)
+
     def _user_setup(self, test='BMonly'):
         """ Customized setup for testing purposes (mainly for debugging)
         TODO: after code refactoring, we need to check if this still works
@@ -816,10 +1033,22 @@ class Rubble:
 
         if test == 'BMonly':
             # for Brownian motion only (and only same-sized solids collide)
+            self.simple_St_flag = True
+            self.vel_dist_flag = False
+            self.bouncing_flag = False
+            self.frag_flag = False
+            self.mass_transfer_flag = False
+            self.dv = self.dv_BM
             self.dv[self.mesh2D_i != self.mesh2D_j] = 0
             self.calculate_kernels()
         elif test == 'BM+turb':
-            # plus the relative turbulence velocities between same-sized solids
+            # same-sized BM plus the relative turbulence velocities between same-sized solids
+            self.simple_St_flag = True
+            self.vel_dist_flag = False
+            self.bouncing_flag = False
+            self.frag_flag = False
+            self.mass_transfer_flag = False
+            self.dv = self.dv_BM
             self.dv[self.mesh2D_i != self.mesh2D_j] = 0
             dv_TM = self.c_s * np.sqrt(2 * self.alpha * self.St)
             dv_TM[self.St > 1] = self.c_s * np.sqrt(2 * self.alpha / self.St[self.St > 1])
@@ -827,24 +1056,76 @@ class Rubble:
             self.calculate_kernels()
         elif test == 'BM+turb+fulldv':
             # full collisions with BM and turbulence from a simpler description
+            self.simple_St_flag = True
+            self.vel_dist_flag = False
+            self.bouncing_flag = False
+            self.frag_flag = False
+            self.mass_transfer_flag = False
+            self.dv = self.dv_BM
             v_TM = self.c_s * np.sqrt(self.alpha * self.St)
             v_TM[self.St > 1] = self.c_s * np.sqrt(self.alpha / self.St[self.St > 1])
             self.dv += np.sqrt(v_TM**2 + v_TM[:, np.newaxis]**2)            
             self.calculate_kernels()
         elif test == 'constK':
             # constant kernel
+            # manually set the number of m_0 to 1.0 (using Nk[1] b/c Nk[0] is for ghost zone)
+            self.Nk[1] = self.kwargs.get("n_0", 1)
+            self.sigma[1] = self.Nk[1] * 3 * self.m[1]
+            self.Na[1] = self.Nk[1] * 3
+            self._Sigma_d = self.get_Sigma_d(self.Nk)
+            self.Sigma_d = self.get_Sigma_d(self.Nk)
+
+            self.simple_St_flag = True
+            self.vel_dist_flag = False
+            self.bouncing_flag = False
+            self.mass_transfer_flag = False
+            self.frag_flag = False
+            self.static_kernel_flag = True
+
             self.dv.fill(1.0)
-            self.geo_cs.fill(np.pi*1e-14)
+            self.geo_cs.fill(self.kwargs.get("alpha_c", 1.0))
             self.vi_fac.fill(1.0)
-            # I think we need much smaller number than 1
             self.calculate_kernels()
         elif test == 'sumK':
-            # constant kernel
+            # sum kernel
+            # manually set the number of m_0 to 1.0 (using Nk[1] b/c Nk[0] is for ghost zone)
+            self.Nk[1] = self.kwargs.get("n_0", 1)
+            self.sigma[1] = self.Nk[1] * 3 * self.m[1]
+            self.Na[1] = self.Nk[1] * 3
+            self._Sigma_d = self.get_Sigma_d(self.Nk)
+            self.Sigma_d = self.get_Sigma_d(self.Nk)
+
+            self.simple_St_flag = True
+            self.vel_dist_flag = False
+            self.bouncing_flag = False
+            self.mass_transfer_flag = False
+            self.frag_flag = False
+            self.static_kernel_flag = True
+
             self.dv.fill(1.0)
-            beta_c = self.kwargs.get('beta_c', 0.5)
-            self.geo_cs = beta_c * self.m_sum_ij
+            self.geo_cs = self.kwargs.get('beta_c', 1.0) * self.m_sum_ij
             self.vi_fac.fill(1.0)
-            # I think we need much smaller number than 1
+            self.calculate_kernels()
+        elif test == "productK":
+            # product kernel
+            # manually set the number of m_0 to 1.0 (using Nk[1] b/c Nk[0] is for ghost zone)
+            self.Nk[1] = self.kwargs.get("n_0", 1)
+            self.sigma[1] = self.Nk[1] * 3 * self.m[1]
+            self.Na[1] = self.Nk[1] * 3
+            self._Sigma_d = self.get_Sigma_d(self.Nk)
+            self.Sigma_d = self.get_Sigma_d(self.Nk)
+
+            self.simple_St_flag = True
+            self.vel_dist_flag = False
+            self.bouncing_flag = False
+            self.mass_transfer_flag = False
+            self.frag_flag = False
+            self.static_kernel_flag = True
+            self.uni_gz_flag = 4  # let the last ghost zone join coagulation with others
+
+            self.dv.fill(1.0)
+            self.geo_cs = self.kwargs.get('gamma_c', 1.0) * self.m_prod_ij
+            self.vi_fac.fill(1.0)
             self.calculate_kernels()
         else:
             raise ValueError(f"Unknown test case: {test}")
@@ -856,44 +1137,63 @@ class Rubble:
         Raccu = self.kwargs.get('Raccu', 0.01)       # in units of AU
         Z = self.kwargs.get('Z', 0.01)               # dust-to-gas ratio
 
+        self.S_annulus = 2 * np.pi * Raccu * 0.1*Raccu * (u.au.to(u.cm))**2
         self.Sigma_dot = Mdot*((u.Msun/u.yr).to(u.g/u.s)) / (2*np.pi * Raccu*(u.au.to(u.cm)) * self.H)
         
-        a_idx_i = 1
-        a_max_in = float(self.kwargs.get('a_max_in', 10)) # largest solids drifting in, in units of cm
+        a_min_in = self.kwargs.get('a_min_in', self.a[1])  # smallest solids drifting in, in units of cm
+        a_max_in = self.kwargs.get('a_max_in', 10)         # largest solids drifting in, in units of cm
+        if a_min_in > a_max_in:
+            self.warn_func(f"The size range of solids drifting in seems off: {a_min_in} > {a_max_in}. Reversed.")
+            a_min_in, a_max_in = a_max_in, a_min_in
+        a_idx_i = np.argmin(abs(self.a - a_min_in))
         a_idx_f = np.argmin(abs(self.a - a_max_in))
+        a_idx_i = max(a_idx_i, 1)
+        a_idx_i = min(a_idx_i, self.Ng+1)
+        a_idx_f = max(a_idx_f, 1)
+        a_idx_i = min(a_idx_i, self.Ng+1)
 
         tmp_sigma = np.zeros(self.Ng+2)
         tmp_sigma[a_idx_i:a_idx_f+1] = self.a[a_idx_i:a_idx_f+1]**(0.5)  # MRN dist
         C_norm = Z * self.Sigma_dot / np.sum(tmp_sigma * self.dlog_a)
         self.dsigma_in = tmp_sigma * C_norm
         
-        a_critD = self.kwargs.get('a_critD', 0.01)   # critical dust size that will be lifted, in units of cm
+        self.a_critD = self.kwargs.get('a_critD', 0.01)   # critical dust size that will be lifted, in units of cm
 
-        Hratio_TL02 = np.zeros(512)
-        St_TL02 = np.logspace(-10, 5, 512)
-        with warnings.catch_warnings():
-            warnings.filterwarnings('ignore', 'overflow encountered in exp')            
-            for i in range(512):
-                Hratio_TL02[i] = (spint.quad(lambda z : rho_d_TL02(1.0, z, 1.0, St_TL02[i], 1e-2), 1.0, np.inf)[0] 
-                                / spint.quad(lambda z : rho_d_TL02(1.0, z, 1.0, St_TL02[i], 1e-2), 0.0, np.inf)[0])
-        if a_critD < self.a[0]:
-            Hratio_TL02[:] = 0
-        elif a_critD > self.a[-1]:
-            pass
-        else:
-            St_crit = self.St[np.argmax(self.a > a_critD)]
-            Hratio_TL02[St_TL02 > St_crit] = 0
-        # we should be able to safely extrapolate to further values
-        self.Hratio_TL02_loss = spinterp.interp1d(St_TL02, Hratio_TL02, fill_value='extrapolate')
+        if self.kwargs.get("TL02_loss", False):
+            # RL: this seems not self-consistent; TODO: we should keep on formula for calculating H_p
+            Hratio_TL02 = np.zeros(512)
+            St_TL02 = np.logspace(-10, 5, 512)
+            with warnings.catch_warnings():
+                warnings.filterwarnings('ignore', 'overflow encountered in exp')
+                for i in range(512):
+                    Hratio_TL02[i] = (spint.quad(lambda z : rho_d_TL02(1., z, 1., St_TL02[i], 1e-2), 1., np.inf)[0]
+                                    / spint.quad(lambda z : rho_d_TL02(1., z, 1., St_TL02[i], 1e-2), 0., np.inf)[0])
+            if self.a_critD < self.a[0]:
+                Hratio_TL02[:] = 0
+            elif self.a_critD > self.a[-1]:
+                pass
+            else:
+                St_crit = self.St[np.argmax(self.a > self.a_critD)]
+                Hratio_TL02[St_TL02 > St_crit] = 0
+            # we should be able to safely extrapolate to further values
+            self.Hratio_loss = spinterp.interp1d(St_TL02, Hratio_TL02, fill_value='extrapolate')
 
     def update_solids(self, dt):
         """ Update the particle distribution every time step if needed """
 
-        if self.closed_box_flag:
+        if self.closed_box_flag: # we may use this to de-clutter other checks on this flag
             return None
 
         # first, calculate sigma loss due to accretion tunnels
-        self.dsigma_out = self.sigma * self.dlog_a / self.Sigma_g * self.Hratio_TL02_loss(self.St) * self.Sigma_dot
+        if self.kwargs.get("TL02_loss", False):
+            self.dsigma_out = self.sigma / self.Sigma_g * self.Hratio_loss(self.St) * self.Sigma_dot
+            # the old treatment is too slow and depends on numerical parameters, so deprecated
+            # self.dsigma_out = self.sigma * self.dlog_a / self.Sigma_g * self.Hratio_loss(self.St) * self.Sigma_dot
+        else:
+            self.Hratio_loss = 1 - spsp.erf(1 / np.sqrt(2) / (self.H_d / self.H))
+            self.Hratio_loss[self.a > self.a_critD] = 0
+            self.dsigma_out = self.sigma / self.Sigma_g * self.Hratio_loss * self.Sigma_dot
+
         self.sigma -= np.minimum(self.dsigma_out * dt, self.sigma)
 
         # second, add dust supply from outer disk
@@ -947,46 +1247,82 @@ class Rubble:
         if not self.static_kernel_flag:
             self.update_kernels()
 
+        # if previous step successfully used dynamic dt, then continue using it
+        # because it is likely that dyn_dt can work for a long time
+        _dt = dt  # save a backup
+        skip_this_cycle = False
+        if self.dyn_dt_success:  # this will be False if dynamic_dt is never used
+            dt = self.dyn_dt * self.s2y
         self._one_step_implicit(dt)
-
-        # issue a warning if time step is too large
         tmp_rerr = abs(self.get_Sigma_d(self.dN) / self._Sigma_d)
+
+        if self.dyn_dt_success and tmp_rerr > self.tol_dyndt:  # if fails, discontinue using it
+            self.dyn_dt_success = False
+            skip_this_cycle = True  # to avoid multiple trial in one cycle
+            self.log_func(
+                f"continue using dyn dt failed with rerr={tmp_rerr:.3e}; revert back to original dt.")
+            dt = _dt
+            self._one_step_implicit(dt)
+            tmp_rerr = abs(self.get_Sigma_d(self.dN) / self._Sigma_d)
+
         if tmp_rerr > self.rerr_th:
             if tmp_rerr > self.rerr_th4dt:
                 dt /= (tmp_rerr / self.rerr_th4dt) * 2
                 self.log_func("dt adjusted temporarily to reduce the relative error: tmp dt = "+f"{dt / self.s2y:.3e}")
                 self._one_step_implicit(dt)
                 tmp_rerr = abs(self.get_Sigma_d(self.dN) / self._Sigma_d)
-            if tmp_rerr > self.rerr_th:
+            if tmp_rerr > self.rerr_th: # rerr_th may < rerr_th4dt, so only a warning is given, no re-calculations
                 self.warn_func("Relative error is somewhat large: sum(dSigma(dN))/Sigma_d = "
                                + f"{tmp_rerr:.3e}. Consider using a smaller timestep "
                                + "(a higher resolution mass grid usually won't help).")
+        else:
+            # only try dynamic_dt when both conditions are meet (to avoid back and forth)
+            if self.dynamic_dt is True and self.dyn_dt_success is False and skip_this_cycle is False:
+                dyn_dt = self.dyn_dt * self.s2y
+                if tmp_rerr * (dyn_dt / dt) < self.tol_dyndt:
+                    tmp_dN = np.copy(self.dN)
+                    self._one_step_implicit(dyn_dt)
+                    tmp_rerr = abs(self.get_Sigma_d(self.dN) / self._Sigma_d)
+                    if tmp_rerr <= self.tol_dyndt:
+                        dt = dyn_dt
+                        self.dyn_dt_success = True
+                        self.log_func(
+                            f"dynamic dt used to speed up this run: dyn dt = {dt / self.s2y:.3e}; now continue with it")
+                    else:
+                        self.log_func(
+                            f"dynamic dt attempt failed with rerr={tmp_rerr:.3e}, revert back to original dt.")
+                        self.dN = tmp_dN
 
-        # handle possible negative numbers
+        # handle possible negative numbers (usually due to large dt)
         tmp_Nk = self.Nk + self.dN
         loop_count = 0
         while np.any(tmp_Nk < 0):
             tmp_Nk[(tmp_Nk < 0) & (self.sigma == 0)] = 0  # if nothing was there, set to zero
-            tiny_idx = (-tmp_Nk / tmp_Nk.max() < 1e-15) & (tmp_Nk < 0)  # if they are tiny compared to Nk.max()
-            tmp_Nk[tiny_idx] = 0
+
+            # what we want is the conservation of mass, so instead of Nk, we should check mass in each bin
+            # previous code on Nk may lead to larger relative error than expected
+            tmp_mass = tmp_Nk * self.m # for checking purpose, no need to include factor 3 and self.dlog_a
+            tiny_idx = (tmp_mass < 0) & (abs(tmp_mass) / tmp_mass.sum() < self.neg2o_th)
+            tmp_Nk[tiny_idx] = 0  # if contribute little to total mass, reset to zero
+
+            # if negative values persist
             if np.any(tmp_Nk < 0):
-                loop_count += 1
+                # external solid supply may also cause this by creating a discontinuity
+                if not self.closed_box_flag:
+                    if not np.any(tmp_Nk * 3 * self.m + self.dsigma_in * dt < 0):
+                        # negative values that can be canceled by supply may be ignored safely
+                        # here a constant supply is assumed for now; may be improved in the future
+                        break
+                # if the issue is more severe, reduce dt
                 if loop_count > self.negloop_tol:
                     raise RuntimeError(f"Reducing dt by 2^{self.negloop_tol} didn't prevent negative Nk.")
                 dt /= 2.0
                 self._one_step_implicit(dt)
                 tmp_Nk = self.Nk + self.dN
+                loop_count += 1
         if loop_count > 0:
             self.log_func("dt reduced to prevent negative Nk: new dt = " + f"{dt / self.s2y:.3e}")
         self.Nk = np.copy(tmp_Nk)
-
-        # if any Nk is still negative
-        if np.any(self.Nk < 0):
-            raise RuntimeError(f"Some surface number density values remain significantly negative:"
-                                + "\n a: " + " ".join(["{:.3e}".format(a) for a in self.a[self.Nk < 0]])
-                                + "\nNk: " + " ".join(["{:.3e}".format(Nk) for Nk in self.Nk[self.Nk < 0]])
-                                + f"\nThis usually means a bad initial distribution or a too-large timestep, "
-                                + f"please try a different setup...")
 
         self.sigma = self.Nk * 3 * self.m
         self.Na = self.Nk * 3
@@ -1057,7 +1393,7 @@ class Rubble:
             self.dat_file.write(self.res4out.tobytes())
 
     def run(self, tlim, dt, out_dt, 
-            burnin_dt=1/365.25, no_burnin=False,
+            burnin_dt=1/365.25, no_burnin=False, ramp_speed=1.01, dynamic_dt=False,
             out_log=True, dump='bin'):
         """ 
         Run simulations and dump results
@@ -1074,6 +1410,11 @@ class Rubble:
             transitional tiny timesteps at the beginning to burn-in smoothly, default: 1 day
         no_burnin : bool
             skip burn-in steps, useful for testing or if you want fixed dt, default: False
+        ramp_speed : float
+            how fast to ramp the initial burnin_dt up to dt, default: 1.01 (1% up each cycle after the 1st yr)
+        dynamic_dt : bool
+            whether to use a larger desired dt whenever relative error is within the input tolerance
+            (i.e., self.rerr < self.tol_dyndt) to speed up this run
         out_log : bool
             whether or not to print log/info/warning/errors to file, default: True
             if set to False, these messages will be directed to "print"
@@ -1084,10 +1425,11 @@ class Rubble:
         Notes
         -----
         1. Again, the results of solving the Smoluchowski equation are known to depend on resolution, initial setup,
-        and the length of time step.  Be sure to test different setups and find the converging behaviors.
+        and the length of time step (and also the Python environment and the machine used).  Be sure to test
+        different setups and find the converging behaviors.
 
-        2. For restarting a simulation, you can directly run this function with a larger tlim
-        (N.B.: restarting from an unfinished burn-in phase may produce slightly different results)
+        2. For restarting a simulation, you may directly run this function again with a larger tlim
+        (N.B.: restarting simulations may produce results slightly different than direct longer simulations)
         """
 
         if out_log:
@@ -1113,60 +1455,101 @@ class Rubble:
         if self.t > 0 and self.cycle_count > 0:
             self.log_func(f"===== Simulation restarts now =====")
             self.open_dump_file('ab' if dump == 'bin' else 'a')
-            self.log_func(f"cycle={self.cycle_count}, t={self.t:.3e}, dt={dt:.3e}, rerr(Sigma_d)={self.rerr:.3e}")
+            self.log_func(f"cycle={self.cycle_count}, t={self.t:.6e}, dt={dt:.3e}, rerr(Sigma_d)={self.rerr:.3e}")
+            self.out_dt = out_dt
+            self.next_out_t = self.t + self.out_dt
         else:
             self.log_func(f"===== Simulation begins now =====")
             dump_func(first_dump=True)
             self.cycle_count = 0
-            self.log_func(f"cycle={self.cycle_count}, t={self.t:.3e}, dt={dt:.3e}, rerr(Sigma_d)={self.rerr:.3e}")
+            self.log_func(f"cycle={self.cycle_count}, t={self.t:.6e}, dt={dt:.3e}, rerr(Sigma_d)={self.rerr:.3e}")
             self.out_dt = out_dt
             dump_func()
-            self.next_out_t += self.out_dt
+            self.next_out_t = self.t + self.out_dt
 
         # let's have some slow burn-in steps if not a restart
         # so we can enter the relatively-smooth profile gradually from the initial profile with discontinuities
-        if self.cycle_count == 0 or no_burnin is True:
+        tmp_dt = burnin_dt
+        if self.cycle_count == 0 and no_burnin is False:
             dt, burnin_dt = burnin_dt, dt
             while self.t + dt < min(tlim, 1):  # alternatively, we can use 4 yrs
                 pre_step_t = time.perf_counter()
                 self.one_step_implicit(dt * self.s2y)
                 self.enforce_mass_con()
                 if not self.closed_box_flag:
-                    self.update_solids(dt * self.s2y)
+                    self.update_solids(self.dt * self.s2y) # dt could have changed
                 self.t += self.dt
                 self.cycle_count += 1
                 post_step_t = time.perf_counter()
-                self.log_func(f"cycle={self.cycle_count}, t={self.t:.3e}yr, dt={self.dt:.3e}, "
+                self.log_func(f"cycle={self.cycle_count}, t={self.t:.6e}yr, dt={self.dt:.3e}, "
                               + f"rerr(Sigma_d)={self.rerr:.3e}, rt={post_step_t - pre_step_t:.3e}")
                 if out_log and self.cycle_count % 100 == 0:
                     fh.flush()
                 if self.t > self.next_out_t - dt / 2:
                     dump_func()
-                    self.next_out_t += self.out_dt
+                    self.next_out_t = self.t + self.out_dt
             dt, burnin_dt = burnin_dt, dt
-            tmp_dt = burnin_dt
 
+            if ramp_speed <= 1.0 or ramp_speed >= 5:
+                self.warn_func(f"ramp_speed should be slightly larger than 1.0; got: {ramp_speed}; fall back to 1.01.")
+                ramp_speed = 1.01
             # then let the burn-in dt gradually ramp up to match the desired dt
             # N.B., with increasing dt, we might miss the next_out_t and lose all the data 
             # if we only output within (out_t-dt/2, out_t+dt/2)
-            while ((self.t + tmp_dt < tlim) and (tmp_dt * 1.01 < dt)):  # + burnin_dt
-                # tmp_dt += burnin_dt  # alternatively, we can use *= 1.01
-                tmp_dt *= 1.01
+            while (self.t + tmp_dt < tlim) and (tmp_dt * ramp_speed < dt):
+                tmp_dt *= ramp_speed
                 pre_step_t = time.perf_counter()
                 self.one_step_implicit(tmp_dt * self.s2y)
                 self.enforce_mass_con()
                 if not self.closed_box_flag:
-                    self.update_solids(tmp_dt * self.s2y)
+                    self.update_solids(self.dt * self.s2y) # dt could have changed
                 self.t += self.dt
                 self.cycle_count += 1
                 post_step_t = time.perf_counter()
-                self.log_func(f"cycle={self.cycle_count}, t={self.t:.3e}yr, dt={self.dt:.3e}, "
+                self.log_func(f"cycle={self.cycle_count}, t={self.t:.6e}yr, dt={self.dt:.3e}, "
                               + f"rerr(Sigma_d)={self.rerr:.3e}, rt={post_step_t - pre_step_t:.3e}")
                 if out_log and self.cycle_count % 100 == 0:
                     fh.flush()
                 if self.t > self.next_out_t - tmp_dt / 2:
                     dump_func()
-                    self.next_out_t += self.out_dt
+                    self.next_out_t = self.t + self.out_dt
+
+        # turn on dynamic dt if specified
+        if dynamic_dt:
+            if self.dyn_dt / dt < 4 or self.out_dt / dt < 4:
+                self.warn_func(
+                    f"Dynamic dt not enabled: dyn_dt/dt={self.dyn_dt / dt:.1f}, out_dt/dt={self.out_dt / dt:.1f}. "
+                    f"One of them is smaller than 4, which won't result in a significant speed gain.")
+            else:
+                # continue to dyn_dt from tmp_dt
+                if False:  #no_burnin is False:
+                    while (self.t + tmp_dt < tlim) and (tmp_dt * ramp_speed < self.dyn_dt):
+                        # tmp_dt += burnin_dt  # alternatively, we can use *= 1.01
+                        tmp_dt *= ramp_speed
+                        pre_step_t = time.perf_counter()
+                        self.one_step_implicit(tmp_dt * self.s2y)
+                        self.enforce_mass_con()
+                        if not self.closed_box_flag:
+                            self.update_solids(self.dt * self.s2y) # dt could have changed
+                        self.t += self.dt
+                        self.cycle_count += 1
+                        post_step_t = time.perf_counter()
+                        self.log_func(f"cycle={self.cycle_count}, t={self.t:.6e}yr, dt={self.dt:.3e}, "
+                                      + f"rerr(Sigma_d)={self.rerr:.3e}, rt={post_step_t - pre_step_t:.3e}")
+                        if out_log and self.cycle_count % 100 == 0:
+                            fh.flush()
+                        if self.t > self.next_out_t - tmp_dt / 2:
+                            dump_func()
+                            self.next_out_t = self.t + self.out_dt
+                # now turn on dynamic_dt
+                self.dynamic_dt = True
+                if self.dyn_dt > self.out_dt:
+                    self.warn_func(f"The desired dynamic dt is reduced to out_dt (={out_dt:.1f}) to secure data.")
+                    self.dyn_dt = self.out_dt
+                if self.tol_dyndt > min(self.rerr_th, self.rerr_th4dt):
+                    self.tol_dyndt = min(self.rerr_th, self.rerr_th4dt)
+                    self.warn_func("The relative error tolerance for using dynamic dt should be smaller than "
+                                   + f"min(rerr_th, rerr_th4dt). Adjusted automatically to {self.tol_dyndt}.")
 
         # Now on to tlim with the input dt
         while self.t + dt < tlim:
@@ -1174,17 +1557,17 @@ class Rubble:
             self.one_step_implicit(dt * self.s2y)
             self.enforce_mass_con()
             if not self.closed_box_flag:
-                self.update_solids(dt * self.s2y)
+                self.update_solids(self.dt * self.s2y) # dt could have changed
             self.t += self.dt
             self.cycle_count += 1
             post_step_t = time.perf_counter()
-            self.log_func(f"cycle={self.cycle_count}, t={self.t:.3e}yr, dt={self.dt:.3e}, "
+            self.log_func(f"cycle={self.cycle_count}, t={self.t:.6e}yr, dt={self.dt:.3e}, "
                           + f"rerr(Sigma_d)={self.rerr:.3e}, rt={post_step_t - pre_step_t:.3e}")
             if out_log and self.cycle_count % 100 == 0:
                 fh.flush()
             if self.t > self.next_out_t - dt / 2:  # to ensure we dump data
                 dump_func()
-                self.next_out_t += self.out_dt
+                self.next_out_t = self.t + self.out_dt
 
         # last time step
         #
@@ -1199,15 +1582,16 @@ class Rubble:
         self.one_step_implicit(dt * self.s2y)
         self.enforce_mass_con()
         if not self.closed_box_flag:
-            self.update_solids(dt * self.s2y)
+            self.update_solids(self.dt * self.s2y) # dt could have changed
         self.t += self.dt
+        self.cycle_count += 1
         post_step_t = time.perf_counter()
 
         dump_func()
         if self.t > self.next_out_t - dt / 2:  # advance next output time anyway
-            self.next_out_t += self.out_dt
+            self.next_out_t = self.t + self.out_dt
 
-        self.log_func(f"cycle={self.cycle_count}, t={self.t:.3e}yr, dt={self.dt:.3e}, "
+        self.log_func(f"cycle={self.cycle_count}, t={self.t:.6e}yr, dt={self.dt:.3e}, "
                           + f"rerr(Sigma_d)={self.rerr:.3e}, rt={post_step_t - pre_step_t:.3e}")
         elapsed_time = time.perf_counter() - s_time
         self.log_func(f"===== Simulation ends now =====\n" + '*' * 80

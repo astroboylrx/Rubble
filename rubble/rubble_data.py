@@ -52,6 +52,7 @@ def loadbin(file_handler, dtype='d', num=1):
         file_handler.seek(ori_pos)
         return None
 
+
 class RubbleData:
     """ Read in simulation data for further analyses """
 
@@ -81,9 +82,16 @@ class RubbleData:
             f.seek(0, 2)
             num_bytes = f.tell() - pos_i
             num_rows = num_bytes // 8 // (self.Ng * 2 + 5)
-            if num_rows * 8 * (self.Ng * 2 + 5) != num_bytes:
+            if num_rows * 8 * (self.Ng * 2 + 5) > num_bytes:
                 raise IOError(f"The number of bytes seems off: Ng={self.Ng}, "
                               + f"num_rows={num_rows}, num_bytes={num_bytes}")
+            elif num_rows * 8 * (self.Ng * 2 + 5) < num_bytes:
+                print(f"Bytes more than data: Ng={self.Ng}, num_rows={num_rows}, num_bytes={num_bytes}"
+                      f"\nreading anyway")
+                num_rows -= 1
+            else:
+                pass
+
             f.seek(4, 0)
             data = loadbin(f, num=num_bytes // 8).reshape([num_rows, self.Ng * 2 + 5])
             f.close()
@@ -189,11 +197,11 @@ class RubbleData:
             fig.tight_layout()
             return fig, ax
 
-    def discretize_colormap(self, N, base_cmap='viridis', 
-                            cut_top=False):
+    def discretize_colormap(self, N, base_cmap='viridis',
+                            cut_top=False, curve_tuning=1.0):
         """
         Create an N-bin discrete colormap from the specified input map
-        
+
         Parameters
         ----------
         N : int
@@ -206,12 +214,13 @@ class RubbleData:
         """
 
         base = plt.cm.get_cmap(base_cmap)
-        color_list = base(np.linspace(0, 1, N+1))
+        color_list = base(np.linspace(0, 1, N + 1))
+        value_list = np.linspace(0, 1, N + 1) ** curve_tuning
         cmap_name = 'discretize ' + base.name
         if cut_top:
-            return LinearSegmentedColormap.from_list(cmap_name, color_list[:-1], N)
+            return LinearSegmentedColormap.from_list(cmap_name, list(zip(value_list[:-1], color_list[:-1])), N)
         else:
-            return LinearSegmentedColormap.from_list(cmap_name, color_list, N)
+            return LinearSegmentedColormap.from_list(cmap_name, list(zip(value_list, color_list)), N)
 
     def plot_time_evolution(self, t_range=None, num_t2plot=1024,
                             ax=None, cmap='viridis', num_colors=20, **kwargs):
@@ -282,11 +291,15 @@ class RubbleData:
             # shading='auto' requires Matplotlib > 3.3
             ax.pcolor(np.log10(self.a), np.log10(log_t), np.log10(sigma_logyr), shading='auto',
                       vmin = kwargs.get("vmin", -17), vmax = kwargs.get("vmax", 3),
-                      cmap = self.discretize_colormap(num_colors, base_cmap=cmap), **(kwargs.get("pcolor_kw", {})))
+                      cmap = self.discretize_colormap(num_colors, base_cmap=cmap,
+                                                      curve_tuning=kwargs.get("curve_tuning", 1.0)),
+                      **(kwargs.get("pcolor_kw", {})))
         except Exception as e:
             ax.pcolorfast(np.log10(self.a), np.log10(log_t), np.log10(sigma_logyr),
                           vmin=kwargs.get("vmin", -17), vmax=kwargs.get("vmax", 3),
-                          cmap=self.discretize_colormap(20, base_cmap='viridis'), **(kwargs.get("pcolor_kw", {})))
+                          cmap=self.discretize_colormap(20, base_cmap=cmap,
+                                                        curve_tuning=kwargs.get("curve_tuning", 1.0)),
+                          **(kwargs.get("pcolor_kw", {})))
 
         ax.set(xlabel=r"log a [cm]", ylabel=r"log t [yr]")
         if fig is None:

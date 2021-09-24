@@ -3,13 +3,13 @@
     This package is created to model the local evolution of solid distribution in size, mass, and surface density
     by solving the Smoluchowski equation (Smoluchowski, M. V. 1916; also often referred as the coagulation equation,
     or the coagulation-fragmentation equation). Rubble is also able to model prescribed physical processes such as
-    bouncing, mass transfer, regulated mass loss/supply, and probabilistic collisional outcomes based on velocity
-    distributions, etc.
+    bouncing, modulated mass transfer, regulated mass loss/supply, and probabilistic collisional outcomes based on
+    velocity distributions, etc.
 
     This package also includes various functions that can be used to analyze and visualize results produced by Rubble.
 """
 
-__version__ = "0.1.2"
+__version__ = "0.2.0"
 __author__ = "Rixin Li"
 __email__ = "rixinli.astro@gmail.com"
 __all__ = ["help_info", "Rubble", "RubbleData"]
@@ -30,13 +30,13 @@ def help_info():
     * Smoluchowski equation (Smoluchowski, M. V. 1916; also often referred as
     * the coagulation equation, or the coagulation-fragmentation equation). 
     * Rubble is also able to model prescribed physical processes such as
-    * bouncing, mass transfer, regulated mass loss/supply, and probabilistic
-    * collisional outcomes based on velocity distributions, etc.
+    * bouncing, modulated mass transfer, regulated mass loss/supply, and 
+    * probabilistic collisional outcomes based on velocity distributions, etc.
     * This package also includes various functions that can be used to  
     * analyze and visualize results produced by Rubble.
     * 
     * Author: Rixin Li
-    * Current Version: 0.1.2
+    * Current Version: 0.2.0
     * Note: This package is still under active development and we welcome
     *       any comments and suggestions.
     **************************************************************************
