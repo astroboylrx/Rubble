@@ -1,4 +1,5 @@
 [![PyPI version](https://badge.fury.io/py/rubble.svg)](https://badge.fury.io/py/rubble)
+[![Paper](https://img.shields.io/static/v1?label=Submitted&message=MethodPaper&color=blue&link=https://lavinia.as.arizona.edu/~rixin/misc/ms_locked.html#Mei5You4Mi4Ma!)](https://lavinia.as.arizona.edu/~rixin/misc/ms_locked.html#Mei5You4Mi4Ma!)
 
 # Rubble: An implicit code for simulating the local evolution of solid size distributions in protoplanetary disks
 
