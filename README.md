@@ -1,9 +1,10 @@
+[![ASCL record](https://img.shields.io/badge/ASCL-2109.011-blue.svg?colorB=262255)](https://ascl.net/2109.011)
 [![PyPI version](https://badge.fury.io/py/rubble.svg)](https://badge.fury.io/py/rubble)
 [![Paper](https://img.shields.io/static/v1?label=Submitted&message=MethodPaper&color=blue&link=https://lavinia.as.arizona.edu/~rixin/misc/ms_locked.html#Mei5You4Mi4Ma!)](https://lavinia.as.arizona.edu/~rixin/misc/ms_locked.html#Mei5You4Mi4Ma!)
 
 # Rubble: An implicit code for simulating the local evolution of solid size distributions in protoplanetary disks
 
-`Rubble` implicitly models the local evolution of dust distributions in size, mass, and surface density by solving the Smoluchowski equation (also known as the coagulation-fragmentation equation) under given disk conditions. The code robustness has been validated by a suite of numerical benchmarks against known analytical and empirical results. `Rubble` is also able to model prescribed physical processes such as bouncing, modulated mass transfer, regulated dust loss/supply, and probabilistic collisional outcomes based on velocity distributions, etc. The package also includes a toolkit for analyzing and visualizing results produced by `Rubble`.
+`Rubble` (Li, Chen, and Lin, submitted) implicitly models the local evolution of dust distributions in size, mass, and surface density by solving the Smoluchowski equation (also known as the coagulation-fragmentation equation) under given disk conditions. The code robustness has been validated by a suite of numerical benchmarks against known analytical and empirical results. `Rubble` is also able to model prescribed physical processes such as bouncing, modulated mass transfer, regulated dust loss/supply, and probabilistic collisional outcomes based on velocity distributions, etc. The package also includes a toolkit for analyzing and visualizing results produced by `Rubble`.
 
 ## Installation
 
