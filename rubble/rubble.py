@@ -1392,7 +1392,7 @@ class Rubble:
             self.res4out = np.hstack([self.t, self.sigma, self.Nk])
             self.dat_file.write(self.res4out.tobytes())
 
-    def run(self, tlim, dt, out_dt, 
+    def run(self, tlim, dt, out_dt, cycle_limit=1000000000,
             burnin_dt=1/365.25, no_burnin=False, ramp_speed=1.01, dynamic_dt=False,
             out_log=True, dump='bin'):
         """ 
@@ -1406,6 +1406,8 @@ class Rubble:
             time step, in units of year
         out_dt : float
             time interval to dump data, in units of year
+        cycle_limit : int
+            number of max cycles, run will terminate if it is exceeded, default: 1e9
         burnin_dt : float
             transitional tiny timesteps at the beginning to burn-in smoothly, default: 1 day
         no_burnin : bool
@@ -1472,7 +1474,7 @@ class Rubble:
         tmp_dt = burnin_dt
         if self.cycle_count == 0 and no_burnin is False:
             dt, burnin_dt = burnin_dt, dt
-            while self.t + dt < min(tlim, 1):  # alternatively, we can use 4 yrs
+            while self.t + dt < min(tlim, 1) and self.cycle_count < cycle_limit:  # alternatively, we can use 4 yrs
                 pre_step_t = time.perf_counter()
                 self.one_step_implicit(dt * self.s2y)
                 self.enforce_mass_con()
@@ -1496,7 +1498,7 @@ class Rubble:
             # then let the burn-in dt gradually ramp up to match the desired dt
             # N.B., with increasing dt, we might miss the next_out_t and lose all the data 
             # if we only output within (out_t-dt/2, out_t+dt/2)
-            while (self.t + tmp_dt < tlim) and (tmp_dt * ramp_speed < dt):
+            while (self.t + tmp_dt < tlim) and (tmp_dt * ramp_speed < dt) and (self.cycle_count < cycle_limit):
                 tmp_dt *= ramp_speed
                 pre_step_t = time.perf_counter()
                 self.one_step_implicit(tmp_dt * self.s2y)
@@ -1552,7 +1554,7 @@ class Rubble:
                                    + f"min(rerr_th, rerr_th4dt). Adjusted automatically to {self.tol_dyndt}.")
 
         # Now on to tlim with the input dt
-        while self.t + dt < tlim:
+        while self.t + dt < tlim and self.cycle_count < cycle_limit:
             pre_step_t = time.perf_counter()
             self.one_step_implicit(dt * self.s2y)
             self.enforce_mass_con()
@@ -1577,22 +1579,22 @@ class Rubble:
         # the original quasi-equilibrium distribution will be modified to a different quasi-equilibrium state
         # (usually slightly but noticable). For now, let's just keep the original dt and run over tlim
         # self.dt = tlim - self.t
+        if self.cycle_count < cycle_limit:
+            pre_step_t = time.perf_counter()
+            self.one_step_implicit(dt * self.s2y)
+            self.enforce_mass_con()
+            if not self.closed_box_flag:
+                self.update_solids(self.dt * self.s2y) # dt could have changed
+            self.t += self.dt
+            self.cycle_count += 1
+            post_step_t = time.perf_counter()
 
-        pre_step_t = time.perf_counter()
-        self.one_step_implicit(dt * self.s2y)
-        self.enforce_mass_con()
-        if not self.closed_box_flag:
-            self.update_solids(self.dt * self.s2y) # dt could have changed
-        self.t += self.dt
-        self.cycle_count += 1
-        post_step_t = time.perf_counter()
+            dump_func()
+            if self.t > self.next_out_t - dt / 2:  # advance next output time anyway
+                self.next_out_t = self.t + self.out_dt
+            self.log_func(f"cycle={self.cycle_count}, t={self.t:.6e}yr, dt={self.dt:.3e}, "
+                              + f"rerr(Sigma_d)={self.rerr:.3e}, rt={post_step_t - pre_step_t:.3e}")
 
-        dump_func()
-        if self.t > self.next_out_t - dt / 2:  # advance next output time anyway
-            self.next_out_t = self.t + self.out_dt
-
-        self.log_func(f"cycle={self.cycle_count}, t={self.t:.6e}yr, dt={self.dt:.3e}, "
-                          + f"rerr(Sigma_d)={self.rerr:.3e}, rt={post_step_t - pre_step_t:.3e}")
         elapsed_time = time.perf_counter() - s_time
         self.log_func(f"===== Simulation ends now =====\n" + '*' * 80
                       + f"\nRun stats:\n\tElapsed wall time: {elapsed_time:.6e} sec"
