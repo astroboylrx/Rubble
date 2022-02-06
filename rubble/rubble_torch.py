@@ -84,71 +84,70 @@ class RubbleTorch:
 
         """ Step 1, build grid for size/mass distributions (symbol: a/m) """
         self.log_amin, self.log_amax, self.num_grid = np.log10(amin), np.log10(amax), num_grid
-        self.num_dec = self.log_amax - self.log_amin  # number of decades in size
-        self.dlog_a = self.num_dec / (self.num_grid - 1)  # size step in log space
-        self.comm_ratio = (10 ** self.num_dec) ** (1 / (self.num_grid - 1))  # the common ratio of the size sequence
+        self.num_dec = self.log_amax - self.log_amin                   # number of decades in size
+        self.dlog_a = self.num_dec / (self.num_grid - 1)               # size step in log space
+        self.comm_ratio = (10**self.num_dec)**(1 / (self.num_grid-1))  # the common ratio of the size sequence
         # one ghost zone is needed on each side (gz means ghost zone; l/r means left/right)
-        self.log_algz, self.log_argz = self.log_amin - self.dlog_a, self.log_amax + self.dlog_a  # left/right ghost zone
+        self.log_algz, self.log_argz = self.log_amin-self.dlog_a, self.log_amax+self.dlog_a  # left/right ghost zone
         # N.B., make sure to use float64 and the correct device
-        self.a = torch.logspace(self.log_algz, self.log_argz, self.num_grid + 2,
-                                device=self.device)  # cell centers of size grid [cm]
-        self.log_a = torch.log10(self.a)  # log cell centers of size grid
-        self.log_a_edge = torch.linspace(self.log_algz - self.dlog_a / 2, self.log_argz + self.dlog_a / 2,
-                                         self.num_grid + 3,
+        self.a = torch.logspace(self.log_algz, self.log_argz, self.num_grid+2,
+                                device=self.device)                    # cell centers of size grid [cm]
+        self.log_a = torch.log10(self.a)                               # log cell centers of size grid
+        self.log_a_edge = torch.linspace(self.log_algz-self.dlog_a/2, self.log_argz+self.dlog_a/2, self.num_grid+3,
                                          device=self.device)
-        self.a_edge = 10 ** self.log_a_edge  # cell edges of size grid
+        self.a_edge = 10**self.log_a_edge                              # cell edges of size grid
 
         # establish the corresponding mass grid
-        self.rho_m = rho_m  # material density of solids
-        self.dlog_m = self.num_dec * 3 / (self.num_grid - 1)  # step in log space along mass
-        self.m = 4 * np.pi / 3 * rho_m * self.a ** 3  # cell center of mass grid [g]
-        self.log_m = torch.log10(self.m)  # log cell center of mass grid
-        self.log_m_edge = 4 * np.pi / 3 * rho_m * self.a_edge ** 3  # log cell edge of mass grid
-        self.m_edge = 4 * np.pi / 3 * rho_m * self.a_edge ** 3  # cell edge of mass grid
+        self.rho_m = rho_m                                             # material density of solids
+        self.dlog_m = self.num_dec * 3 / (self.num_grid - 1)           # step in log space along mass
+        self.m = 4*np.pi/3 * rho_m * self.a**3                         # cell center of mass grid [g]
+        self.log_m = torch.log10(self.m)                               # log cell center of mass grid
+        self.log_m_edge = 4*np.pi/3 * rho_m * self.a_edge**3           # log cell edge of mass grid
+        self.m_edge = 4*np.pi/3 * rho_m * self.a_edge**3               # cell edge of mass grid
 
         # then grids on vertically integrated quantities and other dust properties
-        self.sigma = torch.zeros_like(self.a)  # surface density, [g/cm^2]
-        self.dsigma_in = torch.zeros_like(self.a)  # source term for sigma, [g/cm^2]
-        self.dsigma_out = torch.zeros_like(self.a)  # sink term for sigma, [g/cm^2]
-        self.Nk = torch.zeros_like(self.a)  # number density per log mass bin [1/cm^2]
-        self.dN = torch.zeros_like(self.a)  # dN per time step
-        self.Na = torch.zeros_like(self.a)  # number density per log mass bin [1/cm^2]
-        self.St = torch.zeros_like(self.a)  # Stokes number
-        self.St_regimes = torch.zeros_like(self.a)  # St regimes (Epstein; Stokes; 1<Re<800; Re>800)
-        self.H_d = torch.zeros_like(self.a)  # dust scale height
-        self.eps = torch.zeros_like(self.a)  # midplane dust-to-gas density ratio
-        self.Re_d = self.eps = torch.zeros_like(self.a)  # particle Reynolds-number = 2 a u / nu_mol
-        self.Hratio_loss = torch.zeros_like(self.a)  # mass loss fraction due to accretion funnels
+        self.sigma = torch.zeros_like(self.a)                          # surface density, [g/cm^2]
+        self.dsigma_in = torch.zeros_like(self.a)                      # source term for sigma, [g/cm^2]
+        self.dsigma_out = torch.zeros_like(self.a)                     # sink term for sigma, [g/cm^2]
+        self.Nk = torch.zeros_like(self.a)                             # number density per log mass bin [1/cm^2]
+        self.dN = torch.zeros_like(self.a)                             # dN per time step
+        self.Na = torch.zeros_like(self.a)                             # number density per log mass bin [1/cm^2]
+        self.St = torch.zeros_like(self.a)                             # Stokes number
+        self.St_regimes = torch.zeros_like(self.a)                     # St regimes (Epstein; Stokes; 1<Re<800; Re>800)
+        self.H_d = torch.zeros_like(self.a)                            # dust scale height
+        self.eps = torch.zeros_like(self.a)                            # midplane dust-to-gas density ratio
+        self.Re_d = self.eps = torch.zeros_like(self.a)                # particle Reynolds-number = 2 a u / nu_mol
+        self.Hratio_loss = torch.zeros_like(self.a)                    # mass loss fraction due to accretion funnels
 
         """ Step 2, initialize scalar physical parameters """
-        self.Sigma_d = Sigma_d  # total dust surface density [g/cm^2]
-        self._Sigma_d = Sigma_d  # numerical Sigma_d after discretization
-        self.q = q  # index for size dist., dN/da propto a^{-q}
-        self.p = (q + 2) / 3  # index for mass dist., i.e., dM/da propto a^{-p}
-        self.s = q - 4  # index of sigma per log(a)
-        self.u_b = self.kwargs.get('u_b', 5.0)  # velocity thresholds for bouncing [cm/s]
-        self.u_f = self.kwargs.get('u_f', 100.0)  # velocity thresholds for frag [cm/s]
-        self.xi = self.kwargs.get('xi', 1.83)  # index of fragment distribution
-        self.chi = self.kwargs.get('chi', 1)  # mass [m_projectile] excavated from target
+        self.Sigma_d = Sigma_d                                         # total dust surface density [g/cm^2]
+        self._Sigma_d = Sigma_d                                        # numerical Sigma_d after discretization
+        self.q = q                                                     # index for size dist., dN/da propto a^{-q}
+        self.p = (q + 2) / 3                                           # index for mass dist., i.e., dM/da propto a^{-p}
+        self.s = q - 4                                                 # index of sigma per log(a)
+        self.u_b = self.kwargs.get('u_b', 5.0)                         # velocity thresholds for bouncing [cm/s]
+        self.u_f = self.kwargs.get('u_f', 100.0)                       # velocity thresholds for frag [cm/s]
+        self.xi = self.kwargs.get('xi', 1.83)                          # index of fragment distribution
+        self.chi = self.kwargs.get('chi', 1)                           # mass [m_projectile] excavated from target
         self.mratio_cratering = self.kwargs.get('mratio_cratering', 10)  # minimum mass ratio for cratering to happen
-        self.idx_m_c = 0  # how many grid points for mratio_cratering
-        self.chi_MT = self.kwargs.get('chi_MT', -0.1)  # mass [m_projectile] transferred to target
-        self.mratio_c2MT = self.kwargs.get('mratio_MT', 15)  # transition mass ratio from cratering to MT
-        self.mratio_MT = self.kwargs.get('mratio_MT', 50)  # minimum mass ratio for full mass transfer
-        self.idx_m_MT = 0  # how many grid points for martio_MT
-        self.St_12 = 0  # particles below this are tightly-coupled
-        self.eps_tot = 0.01  # total midplane dust-to-gas density ratio
-        self.FB_eps_cap = 100  # max eps to cap the feedback effects
+        self.idx_m_c = 0                                               # how many grid points for mratio_cratering
+        self.chi_MT = self.kwargs.get('chi_MT', -0.1)                  # mass [m_projectile] transferred to target
+        self.mratio_c2MT = self.kwargs.get('mratio_MT', 15)            # transition mass ratio from cratering to MT
+        self.mratio_MT = self.kwargs.get('mratio_MT', 50)              # minimum mass ratio for full mass transfer
+        self.idx_m_MT = 0                                              # how many grid points for martio_MT
+        self.St_12 = 0                                                 # particles below this are tightly-coupled
+        self.eps_tot = 0.01                                            # total midplane dust-to-gas density ratio
+        self.FB_eps_cap = 100                                          # max eps to cap the feedback effects
 
         # some constants
         self.sqrt_2_pi = np.sqrt(2 * np.pi)
         self.inv_sqrt_2 = 1 / np.sqrt(2)
         self.cgs_k_B = c.k_B.cgs.value
-        self.cgs_mu = 2.3 * c.m_p.cgs.value  # mean molecular weight
-        self.s2y = u.yr.to(u.s)  # ratio to convert seconds to years
-        self.sigma_H2 = 2.0e-15  # cross section for H2 [cm^2] (what if T<70K?)
-        self.S_annulus = 2 * np.pi * 1.0 * 0.1 * (u.au.to(u.cm)) ** 2  # surface an 0.1 AU wide annulus at 1 AU
-        self.feedback_K = 1  # 1/(1 + <eps_tot>)^{K}, for feedback effects
+        self.cgs_mu = 2.3 * c.m_p.cgs.value                            # mean molecular weight
+        self.s2y = u.yr.to(u.s)                                        # ratio to convert seconds to years
+        self.sigma_H2 = 2.0e-15                                        # cross section for H2 [cm^2] (what if T<70K?)
+        self.S_annulus = 2*np.pi * 1.0 * 0.1 * (u.au.to(u.cm))**2      # surface an 0.1 AU wide annulus at 1 AU
+        self.feedback_K = 1                                            # 1/(1 + <eps_tot>)^{K}, for feedback effects
         # zero out more parameters that are initialized in  __init_disk_parameters()
         self.Sigma_g, self.Sigma_dot, self.alpha, self.T = 0, 0, 0, 0
         self.Omega, self.H, self.rho_g0, self.lambda_mpf = 0, 0, 0, 0
@@ -163,7 +162,7 @@ class RubbleTorch:
         # arr_i is [[1,1,1],    arr_j is [[1,2,3],       meaning arr_ij[i][j] is from m_i and m_j
         #           [2,2,2],              [1,2,3],
         #           [3,3,3]],             [1,2,3]]
-        self.m_j = torch.tile(self.m, [self.num_grid + 2, 1])
+        self.m_j = torch.tile(self.m, [self.num_grid+2, 1])
         self.m_i = self.m_j.T
         self.m_sum_ij = self.m + self.m[:, None]
         self.m_prod_ij = self.m * self.m[:, None]
@@ -184,74 +183,74 @@ class RubbleTorch:
         self.idx_jk_diff = mesh3D_j != mesh3D_k
 
         # intermediate tensors used in simulation
-        self.dv_BM = torch.zeros_like(self.m_j)  # relative velocity due to Brownian motion
-        self.dv_TM = torch.zeros_like(self.m_j)  # relative velocity due to gas turbulence
-        self.dv = torch.zeros_like(self.m_j)  # total relative velocity, du_ij
-        self.geo_cs = torch.pi * (self.a + self.a[:, None]) ** 2  # geometrical cross section [cm^2]
-        self.h_ss_ij = torch.zeros_like(self.m_j)  # h_i^2 + h_j^2, ss means "sum of squared" [cm^2]
-        self.vi_fac = torch.zeros_like(self.m_j)  # vertically-integration factor, √(2pi h_ss_ij)
-        self.p_c = torch.zeros_like(self.m_j)  # the coagulation probability
-        self.p_b = torch.zeros_like(self.m_j)  # the bouncing probability
-        self.p_f = torch.zeros_like(self.m_j)  # the fragmentation probability
+        self.dv_BM = torch.zeros_like(self.m_j)                        # relative velocity due to Brownian motion
+        self.dv_TM = torch.zeros_like(self.m_j)                        # relative velocity due to gas turbulence
+        self.dv = torch.zeros_like(self.m_j)                           # total relative velocity, du_ij
+        self.geo_cs = torch.pi * (self.a + self.a[:, None])**2         # geometrical cross section [cm^2]
+        self.h_ss_ij = torch.zeros_like(self.m_j)                      # h_i^2 + h_j^2, ss means "sum of squared" [cm^2]
+        self.vi_fac = torch.zeros_like(self.m_j)                       # vertically-integration factor, √(2pi h_ss_ij)
+        self.p_c = torch.zeros_like(self.m_j)                          # the coagulation probability
+        self.p_b = torch.zeros_like(self.m_j)                          # the bouncing probability
+        self.p_f = torch.zeros_like(self.m_j)                          # the fragmentation probability
 
-        self.K = torch.zeros_like(self.m_j)  # the coagulation kernel
-        self.L = torch.zeros_like(self.m_j)  # the fragmentation kernel
-        self.f_mod = torch.zeros_like(self.m_j)  # modulation factor to disable bins with tiny Nk
+        self.K = torch.zeros_like(self.m_j)                            # the coagulation kernel
+        self.L = torch.zeros_like(self.m_j)                            # the fragmentation kernel
+        self.f_mod = torch.zeros_like(self.m_j)                        # modulation factor to disable bins with tiny Nk
 
         # C is the epsilon matrix to distribute coagulated mass
-        self.C = torch.zeros(self.num_grid + 2, self.num_grid + 2, self.num_grid + 2, device=self.device)
-        self.gF = torch.zeros_like(self.C)  # the gain coeff of power-law dist. of fragments
-        self.lF = torch.ones_like(self.C)  # the loss coeff of power-law dist. of fragments
+        self.C = torch.zeros(self.num_grid+2, self.num_grid+2, self.num_grid+2, device=self.device)
+        self.gF = torch.zeros_like(self.C)                             # the gain coeff of power-law dist. of fragments
+        self.lF = torch.ones_like(self.C)                              # the loss coeff of power-law dist. of fragments
 
         # ultimate matrixes used in the implicit step
-        self.I = torch.eye(self.num_grid + 2, device=self.device)  # identity matrix
-        self.S = torch.zeros_like(self.a)  # source func
-        self.J = torch.zeros_like(self.m_j)  # Jacobian of the source function
-        self.M = torch.zeros_like(self.C)  # kernel of the Smoluchowski equation
-        self.tM = torch.zeros_like(self.C)  # the vertically-integrated kernel, t: tilde
+        self.I = torch.eye(self.num_grid+2, device=self.device)  # identity matrix
+        self.S = torch.zeros_like(self.a)                              # source func
+        self.J = torch.zeros_like(self.m_j)                            # Jacobian of the source function
+        self.M = torch.zeros_like(self.C)                              # kernel of the Smoluchowski equation
+        self.tM = torch.zeros_like(self.C)                             # the vertically-integrated kernel, t: tilde
 
         """ Step 4, initialize numerical variables """
-        self.t = 0  # run time [yr]
-        self.dt = 0  # time step [yr]
-        self.cycle_count = 0  # number of cycles
-        self.rerr = 0  # relative error in total dust surface density
-        self.out_dt = 0  # time interval to output results
-        self.next_out_t = 0  # next time to output results
-        self.res4out = None  # stacked array for output
-        self._root_finding_tmp = 0  # used in root finding
+        self.t = 0                                                     # run time [yr]
+        self.dt = 0                                                    # time step [yr]
+        self.cycle_count = 0                                           # number of cycles
+        self.rerr = 0                                                  # relative error in total dust surface density
+        self.out_dt = 0                                                # time interval to output results
+        self.next_out_t = 0                                            # next time to output results
+        self.res4out = None                                            # stacked array for output
+        self._root_finding_tmp = 0                                     # used in root finding
 
-        self.rerr_th = self.kwargs.get('rerr_th', 1e-6)  # threshold for relative error to issue warnings
-        self.rerr_th4dt = self.kwargs.get('rerr_th4dt', 1e-6)  # threshold for relative error to lower timestep
-        self.neg2o_th = self.kwargs.get('neg2o_th', 1e-15)  # threshold (w.r.t. Sigma_d) to zero out Nk[Nk<0]
-        self.negloop_tol = self.kwargs.get('negloop_tol', 10)  # max. No. of loops to half dt to avoid Nk<0
+        self.rerr_th = self.kwargs.get('rerr_th', 1e-6)                # threshold for relative error to issue warnings
+        self.rerr_th4dt = self.kwargs.get('rerr_th4dt', 1e-6)          # threshold for relative error to lower timestep
+        self.neg2o_th = self.kwargs.get('neg2o_th', 1e-15)             # threshold (w.r.t. Sigma_d) to zero out Nk[Nk<0]
+        self.negloop_tol = self.kwargs.get('negloop_tol', 10)          # max. No. of loops to half dt to avoid Nk<0
 
-        self.dynamic_dt = False  # use a larger desired dt if possible
-        self.dyn_dt = self.kwargs.get('dyn_dt', 1)  # desired dt (only used if it speeds up runs)
-        self.tol_dyndt = self.kwargs.get('tol_dyndt', 1e-7)  # tolerance for relative error to use dyn_dt
-        self.dyn_dt_success = False  # if previous dyn_dt succeed, continue using it
+        self.dynamic_dt = False                                        # use a larger desired dt if possible
+        self.dyn_dt = self.kwargs.get('dyn_dt', 1)                     # desired dt (only used if it speeds up runs)
+        self.tol_dyndt = self.kwargs.get('tol_dyndt', 1e-7)            # tolerance for relative error to use dyn_dt
+        self.dyn_dt_success = False                                    # if previous dyn_dt succeed, continue using it
 
-        self.run_name = run_name  # name of this simulation run
-        self.dat_file = None  # file handler for writing data
-        self.dat_file_name = run_name + ".dat"  # filename for writing data
-        self.log_file = None  # file handler for writing logs
-        self.log_file_name = run_name + ".log"  # filename for writing logs
+        self.run_name = run_name                                       # name of this simulation run
+        self.dat_file = None                                           # file handler for writing data
+        self.dat_file_name = run_name + ".dat"                         # filename for writing data
+        self.log_file = None                                           # file handler for writing logs
+        self.log_file_name = run_name + ".log"                         # filename for writing logs
 
         """ Step 5, set flags """
         self.static_kernel_flag = self.kwargs.get('static_kernel', True)  # assuming kernel to be static
-        self.flag_activated = False  # simply set flag values and skip flag_updated()
-        self._flag_dict = {}  # an internal flag dict for bookkeeping
-        self.debug_flag = self.kwargs.get('debug', False)  # to enable experimental features
-        self.frag_flag = self.kwargs.get('frag', True)  # to consider fragmentation
-        self.bouncing_flag = self.kwargs.get('bouncing', True)  # to include bouncing
-        self.vel_dist_flag = self.kwargs.get('VD', True)  # to include velocity distribution
-        self.mass_transfer_flag = self.kwargs.get('MT', True)  # to calculate mass transfer
-        self.simple_St_flag = self.kwargs.get('simSt', False)  # to only use Epstein regime
-        self.full_St_flag = self.kwargs.get('fullSt', False)  # to consider all four regimes for Stokes number
-        self.uni_gz_flag = self.kwargs.get('uni_gz', False)  # to use unidirectional ghost zones
-        self.f_mod_flag = self.kwargs.get('f_mod', False)  # to modulate bins with tiny Nk
-        self.feedback_flag = False  # to consider dust feedback on diffusivity
-        self.closed_box_flag = self.kwargs.get('CB', True)  # to use a closed box (so no loss/supply)
-        self.dyn_env_flag = self.kwargs.get('dyn_env', False)  # to consider non-static gas disk environment
+        self.flag_activated = False                                    # simply set flag values and skip flag_updated()
+        self._flag_dict = {}                                           # an internal flag dict for bookkeeping
+        self.debug_flag = self.kwargs.get('debug', False)              # to enable experimental features
+        self.frag_flag = self.kwargs.get('frag', True)                 # to consider fragmentation
+        self.bouncing_flag = self.kwargs.get('bouncing', True)         # to include bouncing
+        self.vel_dist_flag = self.kwargs.get('VD', True)               # to include velocity distribution
+        self.mass_transfer_flag = self.kwargs.get('MT', True)          # to calculate mass transfer
+        self.simple_St_flag = self.kwargs.get('simSt', False)          # to only use Epstein regime
+        self.full_St_flag = self.kwargs.get('fullSt', False)           # to consider all four regimes for Stokes number
+        self.uni_gz_flag = self.kwargs.get('uni_gz', False)            # to use unidirectional ghost zones
+        self.f_mod_flag = self.kwargs.get('f_mod', False)              # to modulate bins with tiny Nk
+        self.feedback_flag = False                                     # to consider dust feedback on diffusivity
+        self.closed_box_flag = self.kwargs.get('CB', True)             # to use a closed box (so no loss/supply)
+        self.dyn_env_flag = self.kwargs.get('dyn_env', False)          # to consider non-static gas disk environment
 
         """ Step 6, prepare coefficients and more initializations """
         self.piecewise_coagulation_coeff()
@@ -262,10 +261,11 @@ class RubbleTorch:
             self.__init_update_solids()  # initialize accretion part, based on Mdot, Raccu, H, Z
             # this will update self.S_annulus, which will be used in self.update_kernels
         self.__init_kernel_constants()
+        self.__init_calculate_St()
         self.update_kernels()
 
         self.flag_activated = True  # some flags may change static_kernel_flag
-        self.feedback_flag = self.kwargs.get('FB', False)  # requires initialization of H_d, St, eps
+        self.feedback_flag = self.kwargs.get('FB', False)              # requires initialization of H_d, St, eps
 
         if self.device.type == 'cuda':
             torch.cuda.empty_cache()
@@ -302,24 +302,24 @@ class RubbleTorch:
     def __init_disk_parameters(self):
         """ Set disk parameters, de-clutter other functions """
 
-        self.Sigma_g = self.kwargs.get('Sigma_g', self.Sigma_d * 100)  # total gas surface density [g/cm^2]
-        self.Sigma_dot = 0.0  # accretion rate in surface density
-        self.alpha = self.kwargs.get('alpha', 1e-3)  # alpha-prescription, may != diffusion coeff
-        self.T = self.kwargs.get('T', 280)  # disk temperature [K]
-        self.Omega = 5.631352229752323e-07  # Keplerian orbital frequency [1/s] (@0.5au)
-        self.H = self.kwargs.get('H', 178010309011.3974)  # gas scale height [cm] (2.088e11 if gamma=1.4)
+        self.Sigma_g = self.kwargs.get('Sigma_g', self.Sigma_d*100)    # total gas surface density [g/cm^2]
+        self.Sigma_dot = 0.0                                           # accretion rate in surface density
+        self.alpha = self.kwargs.get('alpha', 1e-3)                    # alpha-prescription, may != diffusion coeff
+        self.T = self.kwargs.get('T', 280)                             # disk temperature [K]
+        self.Omega = 5.631352229752323e-07                             # Keplerian orbital frequency [1/s] (@0.5au)
+        self.H = self.kwargs.get('H', 178010309011.3974)               # gas scale height [cm] (2.088e11 if gamma=1.4)
 
         # more derivations
-        self.rho_g0 = self.Sigma_g / (self.sqrt_2_pi * self.H)  # midplane gas density
+        self.rho_g0 = self.Sigma_g / (self.sqrt_2_pi * self.H)         # midplane gas density
         self.lambda_mpf = 1 / (self.rho_g0 / self.cgs_mu * self.sigma_H2)  # mean free path of the gas [cm]
-        self.c_s = (self.cgs_k_B * self.T / self.cgs_mu) ** 0.5  # gas sound speed [cm/s] (1.1861e5 if gamma=1.4)
-        self.nu_mol = 0.5 * np.sqrt(8 / np.pi) * self.c_s * self.lambda_mpf  # molecular viscosity
+        self.c_s = (self.cgs_k_B * self.T / self.cgs_mu) ** 0.5        # gas sound speed [cm/s] (1.1861e5 if gamma=1.4)
+        self.nu_mol = 0.5 * np.sqrt(8/np.pi) * self.c_s * self.lambda_mpf  # molecular viscosity
 
         # needed for calculating relative velocities
-        self.u_gas_TM = self.c_s * np.sqrt(3 / 2 * self.alpha)  # mean square turbulent gas velocity
+        self.u_gas_TM = self.c_s * np.sqrt(3/2 * self.alpha)           # mean square turbulent gas velocity
         # gas Reynolds number (= ratio of turbulent viscosity, nu_t = alpha c_s H, over molecular viscosity)
         self.Re = self.alpha * self.Sigma_g * self.sigma_H2 / (2 * self.cgs_mu)
-        self.St_12 = 1 / 1.6 * self.Re ** (-1 / 2)  # critical Stokes number for tightly coupled
+        self.St_12 = 1/1.6 * self.Re ** (-1/2)                         # critical Stokes number for tightly coupled
 
     def get_Sigma_d(self, any_N):
         """ Integrate the vertically integrated surface number density per log mass to total dust surface density """
@@ -394,11 +394,11 @@ class RubbleTorch:
 
         if not coag2nearest:
             # formula from Brauer+2008
-            merger_n = torch.searchsorted(self.m, self.m_sum_ij)  # idx for m_n, searchsorted give where to insert
-            merger_m = merger_n - 1  # idx for m_m,
-            epsilon = torch.zeros_like(self.m_j)  # epsilon, see reference
-            epsilon2 = torch.zeros_like(self.m_j)  # 1 - epsilon for non-ghost zone
-            ngz_mask = merger_m <= self.num_grid  # non-ghost-zone mask
+            merger_n = torch.searchsorted(self.m, self.m_sum_ij)       # idx for m_n, searchsorted give where to insert
+            merger_m = merger_n - 1                                    # idx for m_m,
+            epsilon = torch.zeros_like(self.m_j)                       # epsilon, see reference
+            epsilon2 = torch.zeros_like(self.m_j)                      # 1 - epsilon for non-ghost zone
+            ngz_mask = merger_m <= self.num_grid                       # non-ghost-zone mask
 
             epsilon[merger_m > self.num_grid] = \
                 self.m_sum_ij[merger_m > self.num_grid] / self.m[merger_m[merger_m > self.num_grid]]
@@ -413,14 +413,14 @@ class RubbleTorch:
 
         else:
             nth_right_edge = torch.searchsorted(self.m_edge, self.m_sum_ij)
-            merger = nth_right_edge - 1  # idx for m_nearest
-            epsilon = torch.zeros_like(self.m_j)  # epsilon, see reference
-            ngz_mask = merger <= self.num_grid  # non-ghost-zone mask
+            merger = nth_right_edge - 1                                # idx for m_nearest
+            epsilon = torch.zeros_like(self.m_j)                       # epsilon, see reference
+            ngz_mask = merger <= self.num_grid                         # non-ghost-zone mask
 
             epsilon[merger > self.num_grid] = self.m_sum_ij[merger > self.num_grid] / self.m[-1]
             epsilon[ngz_mask] = self.m_sum_ij[ngz_mask] / self.m[merger[ngz_mask]]
 
-            merger[merger > self.num_grid] = self.num_grid + 1  # make sure k stays in bound
+            merger[merger > self.num_grid] = self.num_grid + 1         # make sure k stays in bound
             self.C[mesh2D_i.flatten(), mesh2D_j.flatten(), merger.flatten()] = epsilon.flatten()
 
         if self.device.type == 'cuda':
@@ -495,20 +495,20 @@ class RubbleTorch:
         """
 
         C_norm = torch.zeros_like(self.a)
-        tmp_Nk = torch.tril(self.m_j ** (-self.xi + 1), -1)  # fragments of i into j (= i-1, ..., 0)
+        tmp_Nk = torch.tril(self.m_j**(-self.xi + 1), -1)              # fragments of i into j (= i-1, ..., 0)
         C_norm[1:] = self.m[1:] / torch.sum(tmp_Nk * self.m_j, 1)[1:]  # this only skip the first row, still i-1 to 0
 
         if False:
             """ Below are a few alternate options to distribute fragments """
             # A. this one somehow slows the program dramatically!!!
-            tmp_Nk = torch.tril(self.m_j ** (-self.xi + 1))  # fragments of i into j (= i, ..., 0)
+            tmp_Nk = torch.tril(self.m_j**(-self.xi+1))                # fragments of i into j (= i, ..., 0)
             C_norm = self.m / torch.sum(tmp_Nk * self.m_j, 1)
             # B. this one also slows the program dramatically!!!
-            tmp_Nk = torch.tril(self.m_j ** (-self.xi + 1))  # fragments of i into j (= i, ..., 1)
+            tmp_Nk = torch.tril(self.m_j**(-self.xi+1))                # fragments of i into j (= i, ..., 1)
             C_norm[1:] = self.m[1:] / torch.sum(tmp_Nk[:, 1:] * self.m_j[:, 1:], 1)[1:]
             tmp_Nk[:, 0] = 0
 
-        frag_Nk = tmp_Nk * C_norm[:, None]  # how unit mass at i will be distributed to j
+        frag_Nk = tmp_Nk * C_norm[:, None]                             # how unit mass at i will be distributed to j
 
         # localize variables for simplicity and improve readability
         chi, chi_MT = self.chi, self.chi_MT
@@ -536,7 +536,7 @@ class RubbleTorch:
         del idx_ij_diff, mi_over_mj, tmp_idx
 
         idx_ji_diff = mesh3D_j - mesh3D_i
-        idx_j_MT = idx_ji_diff >= idx_m_MT  # find ji for full MT (m_j/m_i > mratio_MT)
+        idx_j_MT = idx_ji_diff >= idx_m_MT                             # find ji for full MT (m_j/m_i > mratio_MT)
         idx_j_cratering = (idx_ji_diff >= idx_m_c) & (idx_ji_diff < idx_m_MT)  # find ji for cratering & transition
         del idx_ji_diff
         tmp_idx = idx_both_frag & idx_j_MT
@@ -559,7 +559,7 @@ class RubbleTorch:
 
         idx_i_too_large = mesh3D_i - mesh3D_j >= idx_m_c
         idx_j_too_large = mesh3D_j - mesh3D_i >= idx_m_c
-        idx_ij_close = (~(idx_i_too_large ^ idx_j_too_large))  # find ij for complete fragmentation
+        idx_ij_close = (~(idx_i_too_large ^ idx_j_too_large))          # find ij for complete fragmentation
         del idx_i_too_large, idx_j_too_large
 
         tmp_idx = idx_both_frag & idx_ij_close
@@ -598,7 +598,7 @@ class RubbleTorch:
         # ***** turbulent relative velocities: three regimes *****
         # localize variables for simplicity and improve readability
         u_gas_TM, Re, St_12 = self.u_gas_TM, self.Re, self.St_12
-        St_j = torch.tile(self.St, [self.num_grid + 2, 1])
+        St_j = torch.tile(self.St, [self.num_grid+2, 1])
         St_i = St_j.T
 
         # first, tightly coupled particles
@@ -625,22 +625,39 @@ class RubbleTorch:
             # effectively, using alpha_D = alpha / (1 + <eps>)^K, and K defaults to 1
             # N.B., H_d are initialized to zeros, so this flag must be False in the first call
             u_gas_TM *= 1 / np.sqrt(min(self.FB_eps_cap, (1 +
-                                                          (
-                                                                      self.sigma / self.H_d).sum().item() / self.sqrt_2_pi * self.dlog_a / self.rho_g0) ** self.feedback_K))
+                (self.sigma/self.H_d).sum().item()/self.sqrt_2_pi*self.dlog_a / self.rho_g0)**self.feedback_K))
 
-        self.dv_TM = self.dv_TM * u_gas_TM
+        # move this step to below so we can repeat less
+        # self.dv_TM = self.dv_TM * u_gas_TM
         # print(f"u_gas_TM={u_gas_TM:.3e}, St_12={St_12:.3e}, Re={Re:.3e}")
 
         # sum up all contributions to the relative velocities
-        self.dv = torch.sqrt(self.dv_BM ** 2 + self.dv_TM ** 2)
+        self.dv = torch.sqrt(self.dv_BM ** 2 + (self.dv_TM * u_gas_TM) ** 2)
         # if you want to Gaussian smooth the 2D dv array, use this
         # sigma = [3, 3] # [sigma_y, sigma_x]
         # self.dv = sp.ndimage.filters.gaussian_filter(self.dv, sigma, mode='constant')
 
-    def calculate_St_new(self):
-        """
+    def __init_calculate_St(self):
+        """ Calculate the Stokes number of particles that does not depend on dv """
 
-        """
+        # first iteration, assume Re_d < 1 and then calculate St based on lambda_mpf
+        if self.simple_St_flag:
+            # only use Epstein regime
+            self.St_regimes = torch.ones_like(self.St)
+            self.St = self.rho_m * self.a / self.Sigma_g * torch.pi / 2
+        else:
+            # default: use Epstein regime + Stokes regime
+            self.St_regimes[self.a < self.lambda_mpf * 9 / 4] = 1
+            self.St_regimes[self.a >= self.lambda_mpf * 9 / 4] = 2
+            self.St[self.St_regimes == 1] = (self.rho_m * self.a / self.Sigma_g * torch.pi / 2)[self.St_regimes == 1]
+            self.St[self.St_regimes == 2] = (self.sqrt_2_pi / 9 * (self.rho_m * self.sigma_H2 * self.a ** 2)
+                                             / self.cgs_mu / self.H)[self.St_regimes == 2]
+
+        self.calculate_dv()
+
+    def calculate_St_new(self):
+        """ Calculate the Stokes number of particles (and dv, dv2gas) """
+
         pass
 
     def calculate_St(self):
@@ -680,6 +697,7 @@ class RubbleTorch:
               particles (~ 10^3 cm) drops faster (since 1/St is smaller), probably indicating easier breakthrough.
         """
 
+        """
         # first iteration, assume Re_d < 1 and then calculate St based on lambda_mpf
         if self.simple_St_flag:
             # only use Epstein regime
@@ -691,9 +709,16 @@ class RubbleTorch:
             self.St_regimes[self.a >= self.lambda_mpf * 9 / 4] = 2
             self.St[self.St_regimes == 1] = (self.rho_m * self.a / self.Sigma_g * torch.pi / 2)[self.St_regimes == 1]
             self.St[self.St_regimes == 2] = (self.sqrt_2_pi / 9 * (self.rho_m * self.sigma_H2 * self.a ** 2)
-                                             / self.cgs_mu / self.H)[self.St_regimes == 2]
+                                            / self.cgs_mu / self.H)[self.St_regimes == 2]
+        """
 
-        self.calculate_dv()
+        if self.dyn_env_flag is True:
+            self.__init_calculate_St()
+
+        if self.feedback_flag:
+            u_gas_TM = self.u_gas_TM / np.sqrt(min(self.FB_eps_cap, (1 +
+                  (self.sigma/self.H_d).sum().item()/self.sqrt_2_pi*self.dlog_a / self.rho_g0)**self.feedback_K))
+            self.dv = torch.sqrt(self.dv_BM ** 2 + (self.dv_TM * u_gas_TM) ** 2)
 
         if not self.full_St_flag:
             return None
@@ -711,40 +736,21 @@ class RubbleTorch:
                 + "velocities.  You may consider setting Rubble.full_St_flag = False to only use Epstein regime "
                 + "and Stokes regime, neglecting turbulent regime.")
         if self.Re_d.max() > 1:
-            tmp_St_regimes = torch.clone(self.St_regimes)
+            # tmp_St_regimes = torch.clone(self.St_regimes)  # not used anymore after fixing St formula typo from B11
+            self.St_regimes[self.a < self.lambda_mpf * 9 / 4] = 1
+            self.St_regimes[self.a >= self.lambda_mpf * 9 / 4] = 2
             self.St_regimes[(self.Re_d >= 1) & (self.Re_d < 800)] = 3
             self.St_regimes[self.Re_d >= 800] = 4
-            tmp_loop_count = 0
-            while torch.any(tmp_St_regimes != self.St_regimes):
-                tmp_St_regimes = torch.clone(self.St_regimes)
-                self.St[self.St_regimes == 1] = (self.rho_m * self.a / self.Sigma_g * np.pi / 2)[self.St_regimes == 1]
-                self.St[self.St_regimes == 2] = (2 * self.rho_m * self.a ** 2 / (9 * self.nu_mol * self.rho_g0)
-                                                 * self.c_s / self.H)[self.St_regimes == 2]
-                self.St[self.St_regimes == 3] = (2 ** 0.6 * self.rho_m * self.a ** 1.6
-                                                 / (9 * self.nu_mol ** 0.6 * self.rho_g0 * self.dv[0] ** 0.4)
-                                                 * self.c_s / self.H)[self.St_regimes == 3]
-                self.St[self.St_regimes == 4] = ((6 * self.rho_m * self.a / (self.rho_g0 * self.dv[0]))
-                                                 * self.c_s / self.H)[self.St_regimes == 4]
-                self.calculate_dv()
-                self.Re_d = 2 * self.a * self.dv[0] / self.nu_mol
-                self.St_regimes[self.a < self.lambda_mpf * 9 / 4] = 1
-                self.St_regimes[(self.a >= self.lambda_mpf * 9 / 4) & (self.Re_d < 1)] = 2
-                self.St_regimes[(self.Re_d >= 1) & (self.Re_d < 800)] = 3
-                self.St_regimes[self.Re_d >= 800] = 4
-                tmp_loop_count += 1
-                if tmp_loop_count > 5:
-                    if torch.count_nonzero(tmp_St_regimes != self.St_regimes) < min(10, int(self.num_grid / 15)):
-                        self.warn(
-                            f"A few sizes failed to converge to self-consistent Stokes number after 4 iterations. "
-                            + f"This usually happens around the transition point between Stokes regime 1(2) and 2(3). "
-                            + f"No need to worry for now. The results won't change too much.")
-                        break
-                    else:
-                        raise RuntimeError(
-                            "A range of sizes failed to converge to self-consistent Stokes number after 5 iterations. "
-                            + f"Please submit an issue to https://github.com/astroboylrx/Rubble")
-            if self.debug_flag:
-                self.log(f"loop times in calculate_St: {tmp_loop_count}")
+
+            self.St[self.St_regimes == 1] = (self.rho_m * self.a / self.Sigma_g * np.pi / 2)[self.St_regimes == 1]
+            self.St[self.St_regimes == 2] = (2 * self.rho_m * self.a ** 2 / (9 * self.nu_mol * self.rho_g0)
+                                             * self.c_s / self.H)[self.St_regimes == 2]
+            self.St[self.St_regimes == 3] = (2 ** 0.6 * self.rho_m * self.a ** 1.6
+                                             / (9 * self.nu_mol ** 0.6 * self.rho_g0 * self.dv[0] ** 0.4)
+                                             * self.c_s / self.H)[self.St_regimes == 3]
+            self.St[self.St_regimes == 4] = ((6 * self.rho_m * self.a / (self.rho_g0 * self.dv[0]))
+                                             * self.c_s / self.H)[self.St_regimes == 4]
+            self.calculate_dv()
 
     def __init_kernel_constants(self):
         """ Pre-calculate frequently used constants """
@@ -775,20 +781,20 @@ class RubbleTorch:
             #
             # we can now write down p_f and p_c
 
-            p_f = (1 + self.fac1_vd * torch.exp(-3 / 2 * (u_f / self.dv) ** 2) * (u_f / self.dv)
-                   - torch.special.erf(self.fac2_vd * u_f / self.dv))
+            p_f = (1 + self.fac1_vd * torch.exp(-3/2 * (u_f/self.dv)**2) * (u_f/self.dv)
+                   - torch.special.erf(self.fac2_vd * u_f/self.dv))
 
             # we may try FURTHER and put a bouncing barrier in
             if self.bouncing_flag:
-                p_c = (-self.fac1_vd * torch.exp(-3 / 2 * (u_b / self.dv) ** 2) * (u_b / self.dv)
-                       + torch.special.erf(self.fac2_vd * u_b / self.dv))
+                p_c = (-self.fac1_vd * torch.exp(-3/2 * (u_b/self.dv)**2) * (u_b/self.dv)
+                       + torch.special.erf(self.fac2_vd * u_b/self.dv))
             else:
                 p_c = 1 - p_f
         else:
-            delta_u = 0.2 * u_f  # transition width, ref for 0.2: Birnstiel+2011
-            soften_u_f = u_f - delta_u  # p_f = 0 when du_ij < soften_u_f
-            p_f = torch.zeros_like(self.m_j)  # set all to zero
-            p_f[self.dv > u_f] = 1.0  # set where du_ij > u_f to 1
+            delta_u = 0.2 * u_f                                        # transition width, ref for 0.2: Birnstiel+2011
+            soften_u_f = u_f - delta_u                                 # p_f = 0 when du_ij < soften_u_f
+            p_f = torch.zeros_like(self.m_j)                           # set all to zero
+            p_f[self.dv > u_f] = 1.0                                   # set where du_ij > u_f to 1
             p_f_mask = (self.dv > soften_u_f) & (self.dv < u_f)
             p_f[p_f_mask] = 1 - (u_f - self.dv[p_f_mask]) / delta_u  # set else values
 
@@ -834,8 +840,8 @@ class RubbleTorch:
 
         # Note: since K is symmetric, K.T = K, and dot(K_{ik}, n_i) = dot(K_{ki}, n_i) = dot(n_i, K_{ik})
         # kernel = self.dv * self.geo_cs                               # general kernel = du_ij * geo_cs
-        self.K = self.dv * self.geo_cs * self.p_c  # coag kernel, K_ij
-        self.L = self.dv * self.geo_cs * self.p_f  # frag kernel, L_ij
+        self.K = self.dv * self.geo_cs * self.p_c                      # coag kernel, K_ij
+        self.L = self.dv * self.geo_cs * self.p_f                      # frag kernel, L_ij
 
         if self.f_mod_flag is True:
             # use the modulation function to limit the interactions between mass bins that have low particle numbers
@@ -867,21 +873,21 @@ class RubbleTorch:
         | but np.tensordot provides the possibility of computing dot product along specified axes
         """
 
-        self.M = 0.5 * self.C * self.K[:, :, None]  # multiply C and K with matching i and j
-        self.M[self.idx_ij_same] *= 0.5  # remove collision events counted twice
+        self.M = 0.5 * self.C * self.K[:, :, None]                     # multiply C and K with matching i and j
+        self.M[self.idx_ij_same] *= 0.5                                # remove collision events counted twice
 
         # self.Nk.dot(self.Nk.dot(self.M2)) is equiv to self.Nk * self.K.dot(self.Nk), the original explicit way
         tmp_M = self.K[:, :, None] * torch.ones_like(self.C)
-        tmp_M[self.idx_jk_diff] = 0.0  # b/c M2 has a factor of delta(j-k)
-        tmp_M[self.idx_ij_same] *= 0.5  # remove collision events counted twice
+        tmp_M[self.idx_jk_diff] = 0.0                                  # b/c M2 has a factor of delta(j-k)
+        tmp_M[self.idx_ij_same] *= 0.5                                 # remove collision events counted twice
         self.M -= tmp_M
 
         # the 3rd/4th term is from fragmentation
         if self.frag_flag:
-            self.M += 0.5 * self.L[:, :, None] * self.gF  # multiply gF and L with matching i and j
+            self.M += 0.5 * self.L[:, :, None] * self.gF               # multiply gF and L with matching i and j
             # self.M3[self.mesh3D_i == self.mesh3D_j] *= 0.5           # self.gF already considered this 0.5 factor
 
-            self.M -= self.L[:, :, None] * self.lF  # multiply lF and L with matching i and j
+            self.M -= self.L[:, :, None] * self.lF                     # multiply lF and L with matching i and j
             # self.M4[self.idx_jk_diff] = 0.0                          # self.lF alrady considered this
             # self.M4[self.idx_ij_same] *= 0.5                         # self.lF alrady considered this
 
@@ -894,7 +900,8 @@ class RubbleTorch:
     def update_kernels(self, update_coeff=False):
         """ Update collisional kernels """
 
-        if self.f_mod_flag is True and self.feedback_flag is False and self.cycle_count > 0:
+        if self.f_mod_flag is True and self.feedback_flag is False and self.dyn_env_flag is False \
+                and self.cycle_count > 0:
             # use the modulation function to limit the interactions between mass bins that have low particle numbers
             # if w/o feedback effects, we don't need to go through the entire update_kernels procedure, only new f_mod
             # and new tM are needed. Thus, we squeeze them here
@@ -931,12 +938,10 @@ class RubbleTorch:
         # self._update_disk_parameters()
 
         # then, calculate solid properties
-        self.calculate_St()
-
         if self.feedback_flag:
             # make a closer guess on the total midplane dust-to-gas density ratio
             self.H_d = self.H / torch.sqrt(1 + self.St / self.alpha
-                                           * min(self.FB_eps_cap, (1 + self.eps.sum().item()) ** self.feedback_K))
+                                           * min(self.FB_eps_cap, (1 + self.eps.sum().item())**self.feedback_K))
             self.eps = self.sigma * self.dlog_a / self.sqrt_2_pi / self.H_d / self.rho_g0
             self.eps_tot = self.eps.sum().item()
             self.calculate_St()
@@ -969,7 +974,7 @@ class RubbleTorch:
                     if tmp_sln.converged and np.isfinite(tmp_sln.root):
                         _root_finding_succeed = True
                         self.H_d = self.H / torch.sqrt(1 + self.St / self.alpha
-                                                       * min(self.FB_eps_cap, (1 + tmp_sln.root) ** self.feedback_K))
+                                                       * min(self.FB_eps_cap, (1 + tmp_sln.root)**self.feedback_K))
                         self.eps = self.sigma * self.dlog_a / self.sqrt_2_pi / self.H_d / self.rho_g0
                         self.eps_tot = self.eps.sum().item()
                         self.calculate_St()
@@ -985,12 +990,12 @@ class RubbleTorch:
                     # on a second thought, even if eps.sum() > cap, one more loop is needed to make H_d consistent
                     # manually finding closer solution
                     self.H_d = self.H / torch.sqrt(1 + self.St / self.alpha
-                                                   * min(self.FB_eps_cap,
-                                                         (1 + self.eps.sum().item()) ** self.feedback_K))
+                                                   * min(self.FB_eps_cap, (1 + self.eps.sum().item())**self.feedback_K))
                     self.eps = self.sigma * self.dlog_a / self.sqrt_2_pi / self.H_d / self.rho_g0
                     self.eps_tot = self.eps.sum().item()
                     self.calculate_St()
         else:
+            self.calculate_St()
             # using Eq. 28 in Youdin & Lithwick 2007, ignore the factor: np.sqrt((1 + self.St) / (1 + 2*self.St))
             self.H_d = self.H / torch.sqrt(1 + self.St / self.alpha)
             # the ignored factor may further reduce H_d and lead to a larger solution to midplane eps_tot
@@ -1028,8 +1033,8 @@ class RubbleTorch:
         """ Update flag-dependent kernels whenever a flag changes """
 
         if self.flag_activated:
-            if flag_name in ["f_mod_flag", "feedback_flag"]:
-                if self.f_mod_flag is True or self.feedback_flag is True:
+            if flag_name in ["f_mod_flag", "feedback_flag", "dyn_env_flag"]:
+                if self.f_mod_flag is True or self.feedback_flag is True or self.dyn_env_flag is True:
                     self.static_kernel_flag = False
                 else:
                     self.static_kernel_flag = True
@@ -1090,7 +1095,7 @@ class RubbleTorch:
             self.dv[mesh2D_i != mesh2D_j] = 0
             dv_TM = self.c_s * torch.sqrt(2 * self.alpha * self.St)
             dv_TM[self.St > 1] = self.c_s * torch.sqrt(2 * self.alpha / self.St[self.St > 1])
-            self.dv[mesh2D_i == mesh2D_j] = (self.dv[mesh2D_i == mesh2D_j] ** 2 + dv_TM ** 2) ** 0.5
+            self.dv[mesh2D_i == mesh2D_j] = (self.dv[mesh2D_i == mesh2D_j]**2 + dv_TM**2)**0.5
             self.calculate_kernels()
         elif test == 'BM+turb+fulldv':
             # full collisions with BM and turbulence from a simpler description
@@ -1102,7 +1107,7 @@ class RubbleTorch:
             self.dv = self.dv_BM
             v_TM = self.c_s * torch.sqrt(self.alpha * self.St)
             v_TM[self.St > 1] = self.c_s * torch.sqrt(self.alpha / self.St[self.St > 1])
-            self.dv += torch.sqrt(v_TM ** 2 + v_TM[:, None] ** 2)
+            self.dv += torch.sqrt(v_TM**2 + v_TM[:, None]**2)
             self.calculate_kernels()
         elif test == 'constK':
             # constant kernel
@@ -1174,29 +1179,28 @@ class RubbleTorch:
     def __init_update_solids(self):
         """ Initialized accretion info and calculate the loss/supply rate of solids """
 
-        self.Mdot = self.kwargs.get('Mdot', 3e-9)  # [Msun/yr]
-        self.Raccu = self.kwargs.get('Raccu', 0.01)  # [AU]
-        self.Zacc = self.kwargs.get('Z', 0.01)  # dust-to-gas ratio
+        self.Mdot = self.kwargs.get('Mdot', 3e-9)                      # [Msun/yr]
+        self.Raccu = self.kwargs.get('Raccu', 0.01)                    # [AU]
+        self.Zacc = self.kwargs.get('Z', 0.01)                         # dust-to-gas ratio
         self.a_critD = self.kwargs.get('a_critD', 0.01)  # critical dust size that will be lifted [cm]
 
-        self.S_annulus = 2 * torch.pi * self.Raccu * 0.1 * self.Raccu * (u.au.to(u.cm)) ** 2
-        self.Sigma_dot = self.Mdot * ((u.Msun / u.yr).to(u.g / u.s)) / (
-                    2 * torch.pi * self.Raccu * (u.au.to(u.cm)) * self.H)
+        self.S_annulus = 2 * torch.pi * self.Raccu * 0.1*self.Raccu * (u.au.to(u.cm))**2
+        self.Sigma_dot = self.Mdot*((u.Msun/u.yr).to(u.g/u.s)) / (2*torch.pi * self.Raccu*(u.au.to(u.cm)) * self.H)
 
-        a_min_in = self.kwargs.get('a_min_in', self.a[1])  # smallest solids drifting in [cm]
-        a_max_in = self.kwargs.get('a_max_in', 10)  # largest solids drifting in [cm]
+        a_min_in = self.kwargs.get('a_min_in', self.a[1])              # smallest solids drifting in [cm]
+        a_max_in = self.kwargs.get('a_max_in', 10)                     # largest solids drifting in [cm]
         if a_min_in > a_max_in:
             self.warn(f"The size range of solids drifting in seems off: {a_min_in} > {a_max_in}. Reversed.")
             a_min_in, a_max_in = a_max_in, a_min_in
         a_idx_i = torch.argmin(abs(self.a - a_min_in)).item()
         a_idx_f = torch.argmin(abs(self.a - a_max_in)).item()
         a_idx_i = max(a_idx_i, 1)
-        a_idx_i = min(a_idx_i, self.num_grid + 1)
+        a_idx_i = min(a_idx_i, self.num_grid+1)
         a_idx_f = max(a_idx_f, 1)
-        a_idx_i = min(a_idx_i, self.num_grid + 1)
+        a_idx_i = min(a_idx_i, self.num_grid+1)
 
         tmp_sigma = torch.zeros_like(self.a)
-        tmp_sigma[a_idx_i:a_idx_f + 1] = self.a[a_idx_i:a_idx_f + 1] ** (0.5)  # MRN dist
+        tmp_sigma[a_idx_i:a_idx_f+1] = self.a[a_idx_i:a_idx_f+1]**(0.5)  # MRN dist
         C_norm = self.Zacc * self.Sigma_dot / torch.sum(tmp_sigma * self.dlog_a)
         self.dsigma_in = tmp_sigma * C_norm
 
@@ -1250,8 +1254,8 @@ class RubbleTorch:
         """ Evolve the particle distribution for dt with one implicit step"""
 
         # ultimately, kernels needs to be updated every time step due to the changes on Sigma_g, T, Pi, kappa, etc.
-        if not self.static_kernel_flag:
-            self.update_kernels()
+        #if not self.static_kernel_flag:
+        #    self.update_kernels()
 
         # if previous step successfully used dynamic dt, then continue using it
         # because it is likely that dyn_dt can work for a long time
@@ -1273,7 +1277,7 @@ class RubbleTorch:
         if tmp_rerr > self.rerr_th:
             if tmp_rerr > self.rerr_th4dt:
                 dt /= (tmp_rerr / self.rerr_th4dt) * 2
-                self.log("dt adjusted temporarily to reduce the relative error: tmp dt = " + f"{dt / self.s2y:.3e}")
+                self.log("dt adjusted temporarily to reduce the relative error: tmp dt = "+f"{dt / self.s2y:.3e}")
                 self._one_step_implicit(dt)
                 tmp_rerr = abs(self.get_Sigma_d(self.dN) / self._Sigma_d)
             if tmp_rerr > self.rerr_th:  # rerr_th may < rerr_th4dt, so only a warning is given, no re-calculations
@@ -1291,7 +1295,7 @@ class RubbleTorch:
                     if tmp_rerr <= self.tol_dyndt:
                         dt = dyn_dt
                         self.dyn_dt_success = True
-                        self.log(f"dynamic dt used to speed up this run: dyn dt={dt / self.s2y:.3e}; continue with it")
+                        self.log(f"dynamic dt used to speed up this run: dyn dt={dt/self.s2y:.3e}; continue with it")
                     else:
                         self.log(f"dynamic dt attempt failed with rerr={tmp_rerr:.3e}, revert back to original dt.")
                         self.dN = tmp_dN
@@ -1332,6 +1336,9 @@ class RubbleTorch:
         self.dt = dt / self.s2y  # dt should be in units of sec, self.dt in units of yr
         self.rerr = (self.get_Sigma_d(self.Nk) - self._Sigma_d) / self._Sigma_d
 
+        if not self.static_kernel_flag:
+            self.update_kernels()  # put it at the cycle end so self.dt can be used in update_disk_parameters
+
     def enforce_mass_con(self):
         """ Enforce the conservation of total solid mass
 
@@ -1369,7 +1376,7 @@ class RubbleTorch:
             self.dat_file.write(self.res4out.tobytes())
 
     def run(self, tlim, dt, out_dt, cycle_limit=1000000000,
-            burnin_dt=1 / 365.25, no_burnin=False, ramp_speed=1.01, dynamic_dt=False, out_log=True):
+            burnin_dt=1/365.25, no_burnin=False, ramp_speed=1.01, dynamic_dt=False, out_log=True):
         """
         Run simulations and dump results
 
@@ -1453,7 +1460,7 @@ class RubbleTorch:
                 self.t += self.dt
                 self.cycle_count += 1
                 post_step_t = time.perf_counter()
-                self.log(f"cycle={self.cycle_count}, t={self.t:.6e}yr, dt={self.dt:.3e}, "
+                self.log(f"cycle={self.cycle_count}, t={self.t:.6e}yr, dt={self.dt:.3e}, T={self.T:.1f}, "
                          f"rerr(Sigma_d)={self.rerr:.3e}, rt={post_step_t - pre_step_t:.3e}")
                 if out_log and self.cycle_count % 100 == 0:
                     fh.flush()
@@ -1478,7 +1485,7 @@ class RubbleTorch:
                 self.t += self.dt
                 self.cycle_count += 1
                 post_step_t = time.perf_counter()
-                self.log(f"cycle={self.cycle_count}, t={self.t:.6e}yr, dt={self.dt:.3e}, "
+                self.log(f"cycle={self.cycle_count}, t={self.t:.6e}yr, dt={self.dt:.3e}, T={self.T:.1f}, "
                          f"rerr(Sigma_d)={self.rerr:.3e}, rt={post_step_t - pre_step_t:.3e}")
                 if out_log and self.cycle_count % 100 == 0:
                     fh.flush()
@@ -1506,7 +1513,7 @@ class RubbleTorch:
                         self.t += self.dt
                         self.cycle_count += 1
                         post_step_t = time.perf_counter()
-                        self.log(f"cycle={self.cycle_count}, t={self.t:.6e}yr, dt={self.dt:.3e}, "
+                        self.log(f"cycle={self.cycle_count}, t={self.t:.6e}yr, dt={self.dt:.3e}, T={self.T:.1f}, "
                                  f"rerr(Sigma_d)={self.rerr:.3e}, rt={post_step_t - pre_step_t:.3e}")
                         if out_log and self.cycle_count % 100 == 0:
                             fh.flush()
@@ -1533,7 +1540,7 @@ class RubbleTorch:
             self.t += self.dt
             self.cycle_count += 1
             post_step_t = time.perf_counter()
-            self.log(f"cycle={self.cycle_count}, t={self.t:.6e}yr, dt={self.dt:.3e}, "
+            self.log(f"cycle={self.cycle_count}, t={self.t:.6e}yr, dt={self.dt:.3e}, T={self.T:.1f}, "
                      f"rerr(Sigma_d)={self.rerr:.3e}, rt={post_step_t - pre_step_t:.3e}")
             if out_log and self.cycle_count % 100 == 0:
                 fh.flush()
@@ -1562,7 +1569,7 @@ class RubbleTorch:
             dump_func()
             if self.t > self.next_out_t - dt / 2:  # advance next output time anyway
                 self.next_out_t = self.t + self.out_dt
-            self.log(f"cycle={self.cycle_count}, t={self.t:.6e}yr, dt={self.dt:.3e}, "
+            self.log(f"cycle={self.cycle_count}, t={self.t:.6e}yr, dt={self.dt:.3e}, T={self.T:.1f}, "
                      f"rerr(Sigma_d)={self.rerr:.3e}, rt={post_step_t - pre_step_t:.3e}")
 
         elapsed_time = time.perf_counter() - s_time
