@@ -1,6 +1,6 @@
 [![ASCL record](https://img.shields.io/badge/ASCL-2109.011-blue.svg?colorB=262255)](https://ascl.net/2109.011)
 [![PyPI version](https://badge.fury.io/py/rubble.svg)](https://badge.fury.io/py/rubble)
-[![Paper](https://img.shields.io/static/v1?label=Accepted_InProduction&message=MethodPaper&color=blue&link=https://doi.org/10.1093/mnras/stab3677)](https://doi.org/10.1093/mnras/stab3677)
+[![Paper](https://img.shields.io/static/v1?label=PublishedMethodPaper&message=DOI:10.1093/mnras/stab3677&color=blue&link=https://doi.org/10.1093/mnras/stab3677)](https://doi.org/10.1093/mnras/stab3677)
 
 # Rubble: An implicit code for simulating the local evolution of solid size distributions in protoplanetary disks
 

@@ -48,6 +48,10 @@ class RubbleTorch:
     feedback_flag = FlagProperty("feedback_flag", "to consider feedback effects on gas diffusivity; default: False")
     closed_box_flag = FlagProperty("closed_box_flag", "to use a closed box w/o solid loss or supply; default: True")
     dyn_env_flag = FlagProperty("dyn_env_flag", "to consider dynamic/live disk environment; default: False")
+    # legacy_parRe_flag: use dv(a, amin) as the dust-to-gas relative velocity for calculating particle Reynolds numbers
+    #                    See notes in method _calculate_St for more details.
+    legacy_parRe_flag = FlagProperty("legacy_parRe_flag",
+                                     "to use 2*a*dv(a, amin)/nu_mol as the particle Reynolds number; default: False")
 
     """ methods """
 
@@ -116,7 +120,8 @@ class RubbleTorch:
         self.St_regimes = torch.zeros_like(self.a)                     # St regimes (Epstein; Stokes; 1<Re<800; Re>800)
         self.H_d = torch.zeros_like(self.a)                            # dust scale height
         self.eps = torch.zeros_like(self.a)                            # midplane dust-to-gas density ratio
-        self.Re_d = self.eps = torch.zeros_like(self.a)                # particle Reynolds-number = 2 a u / nu_mol
+        self.dv2gas = torch.zeros_like(self.a)                         # dust-to-gas relative velocity
+        self.Re_d = torch.zeros_like(self.a)                           # particle Reynolds-number = 2 a u / nu_mol
         self.Hratio_loss = torch.zeros_like(self.a)                    # mass loss fraction due to accretion funnels
 
         """ Step 2, initialize scalar physical parameters """
@@ -251,6 +256,7 @@ class RubbleTorch:
         self.feedback_flag = False                                     # to consider dust feedback on diffusivity
         self.closed_box_flag = self.kwargs.get('CB', True)             # to use a closed box (so no loss/supply)
         self.dyn_env_flag = self.kwargs.get('dyn_env', False)          # to consider non-static gas disk environment
+        self.legacy_parRe_flag = self.kwargs.get("legacy_parRe", False)  # to use legacy particle Reynolds number
 
         """ Step 6, prepare coefficients and more initializations """
         self.piecewise_coagulation_coeff()
@@ -262,6 +268,9 @@ class RubbleTorch:
             # this will update self.S_annulus, which will be used in self.update_kernels
         self.__init_kernel_constants()
         self.__init_calculate_St()
+        # with pointers, calls will be directed to the correct functions
+        self.calculate_St = self._calculate_St
+        self.update_kernels = self._update_kernels
         self.update_kernels()
 
         self.flag_activated = True  # some flags may change static_kernel_flag
@@ -653,14 +662,62 @@ class RubbleTorch:
             self.St[self.St_regimes == 2] = (self.sqrt_2_pi / 9 * (self.rho_m * self.sigma_H2 * self.a ** 2)
                                              / self.cgs_mu / self.H)[self.St_regimes == 2]
 
+        if self.full_St_flag and not self.legacy_parRe_flag:
+            St_tiny = (self.St < self.St_12)
+            self.dv2gas[St_tiny] = self.Re ** (1 / 4) * self.St[St_tiny]
+            St_inter = (self.St >= self.St_12)
+            # np.sqrt((2 * 1.6 - 1 + 2 * (1 / (1 + 1.6)))) = 1.7231456030268508
+            self.dv2gas[St_inter] = torch.sqrt(self.St[St_inter]) * 1.7231456030268508
+
+            self.Re_d = 2 * self.a * self.dv2gas / self.nu_mol
+            # self.St_regimes[self.a < self.lambda_mpf * 9 / 4] = 1
+            self.St_regimes[self.a >= self.lambda_mpf * 9 / 4] = 2
+            self.St_regimes[(self.Re_d >= 1) & (self.Re_d < 800)] = 3
+            self.St_regimes[self.Re_d >= 800] = 4
+
+            # self.St[self.St_regimes == 1] = (self.rho_m * self.a / self.Sigma_g * np.pi / 2)[self.St_regimes == 1]
+            self.St[self.St_regimes == 2] = (2 * self.rho_m * self.a ** 2 / (9 * self.nu_mol * self.rho_g0)
+                                             * self.c_s / self.H)[self.St_regimes == 2]
+            self.St[self.St_regimes == 3] = (2 ** 0.6 * self.rho_m * self.a ** 1.6
+                                             / (9 * self.nu_mol ** 0.6 * self.rho_g0 * self.dv2gas ** 0.4)
+                                             * self.c_s / self.H)[self.St_regimes == 3]
+            self.St[self.St_regimes == 4] = ((6 * self.rho_m * self.a / (self.rho_g0 * self.dv2gas))
+                                             * self.c_s / self.H)[self.St_regimes == 4]
+
         self.calculate_dv()
 
-    def calculate_St_new(self):
-        """ Calculate the Stokes number of particles (and dv, dv2gas) """
+    def _calculate_St(self):
+        """ Calculate the Stokes number of particles (and dv, dv2gas)
 
-        pass
+        Notes:
+            In the method paper (LCL22), we consider dust in a global pressure maximum, where the commonly-used
+        differential drift, settling, or orbital velocity does not contribute to relative dust-to-gas velocity.
+        However, such a dv is required to calculate the particle Reynolds number Re_d = 2*a*dv/nu_mol. For simplicity,
+        we adopted dv(a, amin) to compute Re_d. This "simplification" actually introduced extra dependence on amin
+        and coupled dv and St (since Stokes number depends on dv for turbulent regimes), leading to further
+        complications when feedback_flag is ON (and causing the major performance hit). In addition, dv(a, amin)
+        incorporates the Brownian motions of amin and becomes huge if amin is tiny, shifting a(St=1) to a larger size.
+        What is physically expected for the relative d2g velocity is macroscopic, like differential drift. Here, we
+        neglect the microscopic Brownian motions and reconsider dv from the turbulent relative velocity between dust
+        with size a and gas with St = 0. In this physically motivated way, we eliminate the dependence on amin and
+        decouple dv and St. The resulting St is basically the same for small particles, and turbulence regimes shift
+        toward larger particles. Besides, due to the steeper slope of Stokes regime, a(St=1) is a factor of a few
+        smaller; St for a>10cm is also a factor of a few larger, making breakthrough via mass transfer faster and
+        easier if there are enough large particles.
+        """
 
-    def calculate_St(self):
+        # after decoupling dv[0] and St, there is no need to update St unless Sigma_g changes
+        if self.dyn_env_flag is True:
+            self.__init_calculate_St()
+
+        # self.calculate_dv()
+        # only u_gas_TM changes with eps_tot
+        if self.feedback_flag:
+            u_gas_TM = self.u_gas_TM / np.sqrt(min(self.FB_eps_cap, (1 +
+                  (self.sigma/self.H_d).sum().item()/self.sqrt_2_pi*self.dlog_a / self.rho_g0)**self.feedback_K))
+            self.dv = torch.sqrt(self.dv_BM ** 2 + (self.dv_TM * u_gas_TM) ** 2)
+
+    def _calculate_St_legacy(self):
         """ Calculate the Stokes number of particles (and dv)
 
         REFs: Section 3.5 and Eqs. 10, 14, 57 in Birnstiel+2010
@@ -897,7 +954,133 @@ class RubbleTorch:
         # now convert to vertically integrated kernel
         self.tM = self.M / self.vi_fac[:, :, None]
 
-    def update_kernels(self, update_coeff=False):
+    def _update_kernels(self, update_coeff=False):
+
+        if self.f_mod_flag is True and self.feedback_flag is False and self.dyn_env_flag is False \
+                and self.cycle_count > 0:
+            # use the modulation function to limit the interactions between mass bins that have low particle numbers
+            # if w/o feedback effects, we don't need to go through the entire update_kernels procedure, only new f_mod
+            # and new tM are needed. Thus, we squeeze them here
+            if self.cycle_count == 1:
+                # Previously, self.K/L has been over-written with *= self.f_mod. We need to re-generate them when going
+                # into this branch for the first time
+                # kernel = self.dv * self.geo_cs
+                self.L = self.dv * self.geo_cs * self.p_f
+                self.K = self.dv * self.geo_cs * self.p_c
+            with warnings.catch_warnings():
+                warnings.filterwarnings('ignore', '', RuntimeWarning)
+                tmp_Nk = self.Nk * self.S_annulus
+                self.f_mod = torch.exp(-1 / tmp_Nk[:, None] - 1 / tmp_Nk)
+            # for f_mod only, we cannot just modify K/L since they won't be re-generated
+            tmp_K = self.K * self.f_mod
+            tmp_L = self.L * self.f_mod
+
+            self.M = 0.5 * self.C * tmp_K[:, :, None]  # multiply C and K with matching i and j
+            self.M[self.idx_ij_same] *= 0.5  # less collision events in single particle species
+            tmp_M = tmp_K[:, :, None] * torch.ones_like(self.C)
+            tmp_M[self.idx_jk_diff] = 0.0  # b/c M2 has a factor of delta(j-k)
+            tmp_M[self.idx_ij_same] *= 0.5  # less collision events in single particle species
+            self.M -= tmp_M
+
+            if self.frag_flag:
+                self.M += 0.5 * tmp_L[:, :, None] * self.gF  # multiply gF and L with matching i and j
+                self.M -= tmp_L[:, :, None] * self.lF  # multiply lF and L with matching i and j
+
+            # now convert to vertically integrated kernel
+            self.tM = self.M / self.vi_fac[:, :, None]
+            return None
+
+        # first, update disk parameters if needed in the future
+        # self._update_disk_parameters()
+
+        # then, calculate solid properties
+        self.calculate_St()
+        if self.feedback_flag:
+            # make a closer guess on the total midplane dust-to-gas density ratio
+            self.eps = self.sigma * self.dlog_a / self.sqrt_2_pi / self.H_d / self.rho_g0
+            self.eps_tot = self.eps.sum().item()
+
+            # use root finding to self-consistently calculate the weighted midplane dust-to-gas ratio
+            self._root_finding_tmp = (self.sigma * self.dlog_a / self.sqrt_2_pi / self.rho_g0 / self.H).cpu().numpy()
+            _St = self.St.cpu().numpy()
+            """
+            N.B.: in fact St also depends on eps through dv, but we assume St won't change too much (especially for
+            particles with small St) and solve for eps that makes H_d and eps self-consistent.
+
+            One caveat when eps_tot>>1 though: 
+            each time update_kernels() is called, St in the high mass tail varies,
+            leading to *slightly* different St, dv, and thus *slightly* different kernels (K varies more, L less)
+
+            spopt.root_scalar only utilize CPU, if torch.sum uses GPU, the communications between CPU&GPU is
+            very expensive, especially when root_scalar requires multiple (>10) function calls.
+            Benchmarks show that tmp_sln on CPU solely cost 80e-6s, tmp_sln on CPU+GPU cost 1.84ms. An alternative
+            coding choice is to use et/x0/x1 as scalar_tensor and eliminate the call item(), which however cost
+            2.14ms, somewhat more.
+            """
+            try:
+                with warnings.catch_warnings():
+                    warnings.filterwarnings('ignore')
+                    tmp_sln = spopt.root_scalar(lambda et: et - np.sum(self._root_finding_tmp * (
+                            1 + _St / self.alpha * min(self.FB_eps_cap,
+                                                       (1 + et) ** self.feedback_K)) ** 0.5).item(),
+                                                x0=self.eps_tot, x1=self.eps_tot * 5, method='brentq',
+                                                bracket=[self.eps_tot * 0.2, self.eps_tot * 100])
+                    if tmp_sln.converged and np.isfinite(tmp_sln.root):
+                        _root_finding_succeed = True
+                        self.H_d = self.H / torch.sqrt(1 + self.St / self.alpha
+                                                       * min(self.FB_eps_cap, (1 + tmp_sln.root)**self.feedback_K))
+                        self.eps = self.sigma * self.dlog_a / self.sqrt_2_pi / self.H_d / self.rho_g0
+                        self.eps_tot = self.eps.sum().item()
+                    else:
+                        raise RuntimeError("solution not converged")
+            except Exception as e:
+                self.warn("Root finding for the total midplane dust-to-gas density ratio failed. "
+                          + "\nError message: " + e.__str__() + "\nFall back to use five iterations.")
+                for idx_fb in range(4):
+                    # if eps.sum() is already larger than the desired capped value, skip
+                    # if (1 + self.eps.sum())**self.feedback_K > self.FB_eps_cap:
+                    #     break
+                    # on a second thought, even if eps.sum() > cap, one more loop is needed to make H_d consistent
+                    # manually finding closer solution
+                    self.H_d = self.H / torch.sqrt(1 + self.St / self.alpha
+                                                   * min(self.FB_eps_cap, (1 + self.eps.sum().item())**self.feedback_K))
+                    self.eps = self.sigma * self.dlog_a / self.sqrt_2_pi / self.H_d / self.rho_g0
+                    self.eps_tot = self.eps.sum().item()
+        else:
+            # using Eq. 28 in Youdin & Lithwick 2007, ignore the factor: np.sqrt((1 + self.St) / (1 + 2*self.St))
+            self.H_d = self.H / torch.sqrt(1 + self.St / self.alpha)
+            # the ignored factor may further reduce H_d and lead to a larger solution to midplane eps_tot
+            self.eps = self.sigma * self.dlog_a / self.sqrt_2_pi / self.H_d / self.rho_g0
+            self.eps_tot = self.eps.sum().item()
+
+        if self.kwargs.get("B10_Hd", False):
+            # for debug use only, calculate the solid scale height based on Eq. 51 in Birnstiel+2010
+            # this formula mainly focuses on smaller particles and results in super small H_d for St >> 1
+            # which may be improved by adding limits from the consideration of KH effects
+            self.H_d = self.H * torch.minimum(
+                torch.scalar_tensor(1.0),
+                torch.sqrt(self.alpha / (torch.minimum(self.St, torch.scalar_tensor(0.5)) * (1 + self.St ** 2))))
+            self.eps = self.sigma * self.dlog_a / self.sqrt_2_pi / self.H_d / self.rho_g0
+
+        self.h_ss_ij = self.H_d ** 2 + self.H_d[:, None] ** 2
+        self.vi_fac = torch.sqrt(2 * torch.pi * self.h_ss_ij)
+
+        if update_coeff:
+            # currently, no flag requires updateing coagulation coeff
+            # self.piecewise_coagulation_coeff()
+            self.gF.fill_(0)  # reset the gain coeff
+            self.lF.fill_(1)  # reset the loss coeff
+            self.__init_powerlaw_fragmentation_coeff()
+            self.powerlaw_fragmentation_coeff()
+
+        # if needed, update how solid loss/supply should be calculated
+        # if self.dyn_env_flag:
+        #     self.init_update_solids()
+
+        # finally, re-evaluate kernels
+        self.calculate_kernels()
+
+    def _update_kernels_legacy(self, update_coeff=False):
         """ Update collisional kernels """
 
         if self.f_mod_flag is True and self.feedback_flag is False and self.dyn_env_flag is False \
@@ -1041,6 +1224,27 @@ class RubbleTorch:
             if flag_name in ["closed_box_flag", ]:
                 if self.closed_box_flag is False:
                     self.__init_update_solids()
+            if flag_name in ["simple_St_flag", "full_St_flag"]:
+                self.__init_calculate_St()
+            if flag_name in ["legacy_parRe_flag"]:
+                if self.legacy_parRe_flag:
+                    self.__init_calculate_St()
+                    self.calculate_St = self._calculate_St_legacy
+                    self.update_kernels = self._update_kernels_legacy
+                else:
+                    self.__init_calculate_St()
+                    self.calculate_St = self._calculate_St
+                    self.update_kernels = self._update_kernels
+
+            # N.B., for legacy_parRe_flag = True, St/dv[0]/H_d/eps change modestly every time update_kernels is called,
+            # due to the fact that St[St_regimes == 3|4] and dv[0] are mutually dependent to each other.
+            # However, flag_updated calls update_kernels a lot after flag_activated is switched to True.
+            # To produce consistent results that do not depend on how (i.e., in which order) flags are set,
+            # it is important to reset St calculations to the initial state. The price is slightly more discrepancy
+            # w.r.t. legacy results in the method paper (on the order of 1e-6).
+            if self.legacy_parRe_flag is True:
+                self.__init_calculate_St()
+            # finally, update kernels
             if flag_name in ["mass_transfer_flag", ]:
                 self.update_kernels(update_coeff=True)
             else:
