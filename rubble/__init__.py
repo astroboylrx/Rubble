@@ -9,14 +9,16 @@
     The package also includes a toolkit for analyzing and visualizing results produced by Rubble.
 """
 
-__version__ = "0.2.2"
+__version__ = "0.3.0"
 __author__ = "Rixin Li"
 __email__ = "rixinli.astro@gmail.com"
 __all__ = ["help_info", "Rubble", "RubbleData"]
 
 from .rubble import Rubble
 from .rubble_data import RubbleData
-from .rubble_torch import RubbleTorch
+
+# Backward compatibility alias
+RubbleTorch = Rubble
 
 def help_info():
     """ Print Basic Help Info """
@@ -39,7 +41,7 @@ def help_info():
     * results produced by Rubble.
     * 
     * Author: Rixin Li
-    * Current Version: 0.2.2
+    * Current Version: 0.3.0
     * Note: This package is still under active development and we welcome
     *       any comments and suggestions.
     **************************************************************************
