@@ -4,6 +4,7 @@ import numpy as np
 import scipy.optimize as spopt
 import logging
 import time
+import sys
 import warnings
 import torch
 
@@ -148,6 +149,7 @@ class RubbleTorch:
         self.sqrt_2_pi = np.sqrt(2 * np.pi)
         self.inv_sqrt_2 = 1 / np.sqrt(2)
         self.cgs_k_B = c.k_B.cgs.value
+        self.cgs_sigma_sb = c.sigma_sb.cgs.value
         self.cgs_mu = 2.3 * c.m_p.cgs.value                            # mean molecular weight
         self.s2y = u.yr.to(u.s)                                        # ratio to convert seconds to years
         self.sigma_H2 = 2.0e-15                                        # cross section for H2 [cm^2] (what if T<70K?)
@@ -157,7 +159,19 @@ class RubbleTorch:
         self.Sigma_g, self.Sigma_dot, self.alpha, self.T = 0, 0, 0, 0
         self.Omega, self.H, self.rho_g0, self.lambda_mpf = 0, 0, 0, 0
         self.c_s, self.nu_mol, self.u_gas_TM, self.Re = 0, 0, 0, 0
-        self.Mdot, self.Raccu, self.Zacc = 0, 0, 0
+        self.Mdot, self.nu_disk, self.Raccu, self.Zacc = 0, 0, 0, 0
+        self.kappa, self.kappa_cap, self.delta_kappa_cap = 0, 0, 0
+        self.coeff_kappa_geom, self.coeff_Q_e, dyn_env_burn_in = 0, 0, 0
+        self.T_kappa = self.kwargs.get("T_kappa", "latent_heat")
+        self.T_i, self.kappa_i, self.H2_C, self.sili_C, self.sili_SLH = 0, 0, 0, 0, 0
+        self.Sigma_v, self.P_v_eq, self.P_v_eq0, self.T_a, self.gamma = 0, 0, 0, 0, 0
+        self.dSigma_e, self.dSigma_c, self.dSigma_ec, self.rho_v0 = 0, 0, 0, 0
+        self.dSigma_v2d, self.dSigma_d2v = torch.zeros_like(self.a), torch.zeros_like(self.a)
+        self.dotQ_plus, self.temp_lock_time, self.acc_ramp_time = 0, 0, 0
+        self.a2_o_m = self.a**2 / self.m
+        self.bar2cgs = u.bar.to(u.g/u.cm/u.s**2)
+        self.ev_explicit, self.ev_semi_implicit = False, True
+
         self.__init_disk_parameters()
 
         """ Step 3, initialize tensors for matrix calculations and indices manipulations """
@@ -257,13 +271,14 @@ class RubbleTorch:
         self.closed_box_flag = self.kwargs.get('CB', True)             # to use a closed box (so no loss/supply)
         self.dyn_env_flag = self.kwargs.get('dyn_env', False)          # to consider non-static gas disk environment
         self.legacy_parRe_flag = self.kwargs.get("legacy_parRe", False)  # to use legacy particle Reynolds number
+        self.tmp_debug_flag = self.kwargs.get("tmp_debug", False)
 
         """ Step 6, prepare coefficients and more initializations """
         self.piecewise_coagulation_coeff()
         self.__init_powerlaw_fragmentation_coeff()
         self.powerlaw_fragmentation_coeff()
         self.distribute_solids()
-        if not self.closed_box_flag:
+        if self.closed_box_flag is False or self.dyn_env_flag is True:
             self.__init_update_solids()  # initialize accretion part, based on Mdot, Raccu, H, Z
             # this will update self.S_annulus, which will be used in self.update_kernels
         self.__init_kernel_constants()
@@ -290,7 +305,7 @@ class RubbleTorch:
                 _ = torch.empty(2, device=device)
             except Exception as e:
                 self.err("[device error]:", e)
-                exit(19)  # linux error code for "No such device"
+                sys.exit(19)  # linux error code for "No such device"
         else:
             if torch.cuda.is_available() and not self.kwargs.get("disable_cuda", False):
                 # torch.device('cuda') will use the default CUDA device (the same as cuda:0 in the default setup).
@@ -305,6 +320,16 @@ class RubbleTorch:
                 torch.set_num_threads(self.kwargs.get('num_threads'))
 
         self.log("Selected torch device: ", device, "; default_dtype: ", torch.get_default_dtype())
+
+        # PyTorch optimized linalg at 1.13, where solving a matrix with high condition number yields low accuracy
+        if torch.__version__ >= "1.13":
+            self._get_dN = self._get_dN_after_torch_1_13
+            self._one_step_implicit = self._one_step_implicit_after_torch_1_13
+            self._torch_113_flag = True  # RL: was wrong, now fixed
+        else:
+            self._get_dN = self._get_dN_before_torch_1_13
+            self._one_step_implicit = self._one_step_implicit_before_torch_1_13
+            self._torch_113_flag = False
 
         return device
 
@@ -329,6 +354,119 @@ class RubbleTorch:
         # gas Reynolds number (= ratio of turbulent viscosity, nu_t = alpha c_s H, over molecular viscosity)
         self.Re = self.alpha * self.Sigma_g * self.sigma_H2 / (2 * self.cgs_mu)
         self.St_12 = 1/1.6 * self.Re ** (-1/2)                         # critical Stokes number for tightly coupled
+
+        # dust opacity and evaporation/condensation related
+        self.kappa = self.kwargs.get('kappa', 1)                       # total opacity, in units of cm^2/g
+        self.kappa_cap = self.kwargs.get('kappa_cap', 100)             # maximum kappa allowed
+        # user input; it is possible sound speed is determined in other ways
+        if 'input_c_s' in self.kwargs:
+            self.c_s = self.kwargs['input_c_s']
+        if 'input_mu' in self.kwargs:
+            self.cgs_mu = self.kwargs['input_mu']
+
+        # calculate coefficients used in update_disk_parameters
+        self.coeff_kappa_geom = (3 / (4 * self.rho_m * self.a)) * self.dlog_a
+        self.coeff_Q_e = 0.3 * 2 * np.pi * self.a / 0.29
+        self.delta_kappa_cap = self.kwargs.get("delta_kappa_cap", 0.01)
+        self.dyn_env_burn_in = self.kwargs.get('dyn_env_burn_in', 10)  # burn in time (yrs) before activate dyn_env
+        self.temp_lock_time = self.kwargs.get("temp_lock_time", 10)    # burn in time (yrs) before allowing T to change
+        self.acc_ramp_time = self.kwargs.get("acc_ramp_time", 0)       # burn in time (yrs) to ramp up to Mdot linearly
+        self.T_kappa = self.kwargs.get("T_kappa", "power_law")
+        if self.T_kappa == "latent_heat":
+            self.T_i = self.T
+            self.kappa_i = self.kappa
+            self.Sigma_g_i = self.Sigma_g
+            self.H2_C = 1.7e8  # erg / g / K
+            self.sili_C = 1.25e7  # erg / g / K
+            self.sili_SLH = 2.0e11  # 1.5e11  # erg / g
+            self.Omega = ((c.G * c.M_sun / (self.kwargs.get('Raccu', 0.1) * c.au)**3)**0.5).value
+            self.nu_disk = self.alpha * c.R.cgs.value * self.T / (2.3 * self.Omega)
+
+    def update_disk_parameters(self):
+        """ Update disk parameters if they depend on dust properties (e.g., opacity)
+            N.B.: This function should be called after some burn in evolution such
+                  that dust distribution is far from monodisperse (see dyn_env_burn_in).
+        """
+
+        # Step 1, update kappa using current disk parameters (based on Yi-Xian's derivations)
+        old_kappa = self.kappa
+        kappa_geom = self.coeff_kappa_geom * (self.sigma / self.Sigma_g)
+        Q_e = torch.minimum(self.coeff_Q_e * torch.scalar_tensor(self.T), torch.scalar_tensor(2.0))
+        self.kappa = torch.sum(kappa_geom * Q_e).item()
+        # to avoid sudden huge change, we limit how far away kappa gets -- 1% at most by default
+        self.kappa = min((1 + self.delta_kappa_cap) * old_kappa, self.kappa)
+        self.kappa = max((1 - self.delta_kappa_cap) * old_kappa, self.kappa)
+        # apply kappa limiter
+        self.kappa = min(self.kappa, self.kappa_cap)
+        # add gas kappa (does not help when T->0 due to Z->0)
+        self.kappa += 1e-8 * self.rho_g0**(2/3) * self.T**(3)
+
+        # Step 2, update disk parameters that depends on kappa
+        if self.T_kappa == "power_law":
+            # here we assume T propto kappa^(1/5) for a radiative disk profile
+            kappa_ratio = (self.kappa / old_kappa)
+            self.T *= kappa_ratio**(0.2)
+            self.H *= kappa_ratio**(0.1)
+            self.c_s *= kappa_ratio**(0.1)
+            self.rho_g0 *= kappa_ratio ** (-0.3)
+            self.Sigma_g *= kappa_ratio**(-0.2)
+            self.a_critD *= kappa_ratio**(-0.1)  # propto 1/c_s if letting dR/R = H/R
+        elif self.T_kappa == "latent_heat":
+            # alternatively, consider latent heat
+            """
+            try:
+                eq_heat_trans = lambda T: c.sigma_sb.cgs.value / self.Sigma_g**2 * (self.T_i**4/self.kappa_i - T**4/self.kappa) - (self.H2_C + (self._Sigma_d/self.Sigma_g) * self.sili_SLH/20 * np.exp(-(T - 2000)**2/20**2)) * (T-self.T) / (self.dt * self.s2y)
+                tmp_sln = spopt.root_scalar(eq_heat_trans, x0=self.T-10, x1=self.T+10, method='brentq', bracket=[1000, 3000])
+                if tmp_sln.converged and np.isfinite(tmp_sln.root):
+                    dT = tmp_sln.root - self.T
+                else:
+                    raise RuntimeError("solution not converged")
+            except Exception as e:
+                self.warn_func("failed to find dT, fall back to bad method")
+            """
+
+            #dT = c.sigma_sb.cgs.value / self.Sigma_g * (self.T_i**4 * self.Sigma_g * self.kappa_i/(1 + self.Sigma_g**2 * self.kappa_i**2) - self.T**4 * self.Sigma_g * self.kappa/(1 + self.Sigma_g**2 * self.kappa**2)) / (self.H2_C + (self._Sigma_d/self.Sigma_g) * self.sili_SLH/20 * np.exp(-(self.T - 2000)**2/20**2) ) * (self.dt * self.s2y)
+
+            #dT = (c.sigma_sb.cgs.value
+            #      * (self.T_i**4 * self.Sigma_g * self.kappa_i/(1 + self.Sigma_g_i**2 * self.kappa_i**2)
+            #         - self.T**4 * self.Sigma_g * self.kappa/(1 + self.Sigma_g**2 * self.kappa**2))
+            #      * (self.dt * self.s2y)
+            #      - (self.dSigma_ec * self.sili_SLH)) / (self.Sigma_g * self.H2_C)
+
+            # set temp_lock_time to infinity to test if Sigma_v goes to an equilibrium if T does not move
+            if self.t >= self.temp_lock_time:
+                if self.dotQ_plus == 0:
+                    self.nu_disk = self.alpha * c.R.cgs.value * self.T / (2.3 * self.Omega)
+                    self.dotQ_plus = 2 * self.cgs_sigma_sb * self.T**4 * self.kappa/2 / (
+                            1 + (self.Sigma_g*self.kappa/2) ** 2)
+
+                    self.warn(f"Temperature lock deactivated. From disk model, dotQ_plus ="
+                              f" {2.25 * self.nu_disk * self.Omega**2:.3e}. From the current "
+                              f"dust distribution, kappa={self.kappa:.3e}, dotQ_plus={self.dotQ_plus:.3e}, "
+                              f"which will be scaled with T.")
+
+                #dT = (2.25 * self.nu_disk * self.Omega**2
+                dT = (self.dotQ_plus * (self.T / self.T_i)
+                      - 2 * self.cgs_sigma_sb * self.T**4 * self.kappa/2 / (1 + (self.Sigma_g*self.kappa/2)**2)
+                      ) * (self.dt * self.s2y) / self.H2_C \
+                      - (self.dSigma_ec * self.sili_SLH / self.Sigma_g) / self.H2_C
+
+                #self.log(f"kappa = {self.kappa:.2f}, dT = {dT:.2e}")
+                # limiter
+                if abs(dT / self.T) > 0.025:
+                    dT = self.T * 0.025 * (dT / abs(dT))
+                if (self.T + dT) / self.T_i < 0.1:
+                    dT = 0.1 * self.T_i - self.T
+                T_ratio = (self.T + dT) / self.T
+                self.T += dT
+                self.c_s *= T_ratio**(0.5)
+                self.H *= T_ratio**(0.5)
+                self.rho_g0 *= T_ratio ** (-0.5)
+                self.a_critD *= T_ratio**(-0.5)
+
+        # Step 3, update derived parameters that depends on disk parameters
+        self.lambda_mpf = 1 / (self.rho_g0 / self.cgs_mu * self.sigma_H2)
+        self.nu_mol = 0.5 * np.sqrt(8 / np.pi) * self.c_s * self.lambda_mpf
 
     def get_Sigma_d(self, any_N):
         """ Integrate the vertically integrated surface number density per log mass to total dust surface density """
@@ -991,7 +1129,9 @@ class RubbleTorch:
             return None
 
         # first, update disk parameters if needed in the future
-        # self._update_disk_parameters()
+        if self.dyn_env_flag:
+            if self.t >= self.dyn_env_burn_in:
+                self.update_disk_parameters()
 
         # then, calculate solid properties
         self.calculate_St()
@@ -1073,10 +1213,6 @@ class RubbleTorch:
             self.__init_powerlaw_fragmentation_coeff()
             self.powerlaw_fragmentation_coeff()
 
-        # if needed, update how solid loss/supply should be calculated
-        # if self.dyn_env_flag:
-        #     self.init_update_solids()
-
         # finally, re-evaluate kernels
         self.calculate_kernels()
 
@@ -1118,7 +1254,9 @@ class RubbleTorch:
             return None
 
         # first, update disk parameters if needed in the future
-        # self._update_disk_parameters()
+        if self.dyn_env_flag:
+            if self.t >= self.dyn_env_burn_in:
+                self.update_disk_parameters()
 
         # then, calculate solid properties
         if self.feedback_flag:
@@ -1205,10 +1343,6 @@ class RubbleTorch:
             self.__init_powerlaw_fragmentation_coeff()
             self.powerlaw_fragmentation_coeff()
 
-        # if needed, update how solid loss/supply should be calculated
-        # if self.dyn_env_flag:
-        #     self.init_update_solids()
-
         # finally, re-evaluate kernels
         self.calculate_kernels()
 
@@ -1221,8 +1355,8 @@ class RubbleTorch:
                     self.static_kernel_flag = False
                 else:
                     self.static_kernel_flag = True
-            if flag_name in ["closed_box_flag", ]:
-                if self.closed_box_flag is False:
+            if flag_name in ["closed_box_flag", "dyn_env_flag"]:
+                if self.closed_box_flag is False or self.dyn_env_flag is True:
                     self.__init_update_solids()
             if flag_name in ["simple_St_flag", "full_St_flag"]:
                 self.__init_calculate_St()
@@ -1384,7 +1518,7 @@ class RubbleTorch:
         """ Initialized accretion info and calculate the loss/supply rate of solids """
 
         self.Mdot = self.kwargs.get('Mdot', 3e-9)                      # [Msun/yr]
-        self.Raccu = self.kwargs.get('Raccu', 0.01)                    # [AU]
+        self.Raccu = self.kwargs.get('Raccu', 0.1)                     # [AU]
         self.Zacc = self.kwargs.get('Z', 0.01)                         # dust-to-gas ratio
         self.a_critD = self.kwargs.get('a_critD', 0.01)  # critical dust size that will be lifted [cm]
 
@@ -1408,35 +1542,225 @@ class RubbleTorch:
         C_norm = self.Zacc * self.Sigma_dot / torch.sum(tmp_sigma * self.dlog_a)
         self.dsigma_in = tmp_sigma * C_norm
 
+        self.Sigma_v = self.kwargs.get("Sigma_v", 1e-2 * self._Sigma_d)
+        # Below we use Clausius-Clapeyron relation to describe the pressure-temperature profile,
+        # where the original format is P_v_eq = P_v_eq0 * exp(-T_a'/T), but we use (DOI: 10.1088/2041-8205/767/1/L12)
+        # log_10[P_v_eq(SiO2, liq)] = P_v_eq0 - log_10[exp(-T_a'/T)] = 8.203 − 25898.9/T
+        # Note that we re-define T_a to be log_10(e) * T_a', where T_a'(SiO2, liq) ~ 6.0e4 K
+        self.P_v_eq0 = self.kwargs.get('P_v_eq0', 10**8.203)           # the saturated pressure at T_a'
+        self.T_a = self.kwargs.get('T_a', 25898.9)                     # np.log10(np.e) * T_a'
+
+        if self.dyn_env_flag and self.T_kappa == "latent_heat":
+            # calculate the initial kappa
+            kappa_geom = self.coeff_kappa_geom * (self.sigma / self.Sigma_g)
+            Q_e = torch.minimum(self.coeff_Q_e * torch.scalar_tensor(self.T), torch.scalar_tensor(2.0))
+            self.kappa = torch.sum(kappa_geom * Q_e).item()
+            self.log(f"The initial kappa = {self.kappa:.2e}.")
+
+            if self.debug_flag:
+                self.log("Now we adjust dust surface density to make kappa unity.")
+                self.sigma /= self.kappa
+                self.Nk = self.sigma / (3 * self.m)
+                self.Na = self.sigma / self.m
+                self.Sigma_d = self.get_Sigma_d(self.Nk)
+                self._Sigma_d = self.Sigma_d
+                kappa_geom = self.coeff_kappa_geom * (self.sigma / self.Sigma_g)
+                self.kappa = torch.sum(kappa_geom * Q_e).item()
+                self.kappa_i = self.kappa
+
+                """ RL: previously we adjust alpha, Sigma_g to accommodate kappa's change, above we instead adjust kappa
+                self.Raccu = self.kwargs.get('Raccu', 0.1)  # [AU]
+                self.Mdot = self.kwargs.get('Mdot', 3e-9)  # [Msun/yr]
+                alpha_Tkappa = (self.T/373)**(-5) * self.Raccu**(-9/2) * (self.Mdot/10**(-7.5))**(2) * (self.kappa/1)
+
+                self.Sigma_g *= (alpha_Tkappa*0.01 / self.alpha)**(-0.7)
+                self.alpha = alpha_Tkappa * 0.01  # the scale is on alpha_{-2}
+                
+                # update quantities depending on alpha
+                self.rho_g0 = self.Sigma_g / (self.sqrt_2_pi * self.H)
+                self.lambda_mpf = 1 / (self.rho_g0 / self.cgs_mu * self.sigma_H2)
+                self.nu_mol = 0.5 * np.sqrt(8/np.pi) * self.c_s * self.lambda_mpf
+
+                self.u_gas_TM = self.c_s * np.sqrt(3/2 * self.alpha)
+                self.Re = self.alpha * self.Sigma_g * self.sigma_H2 / (2 * self.cgs_mu)
+                self.St_12 = 1/1.6 * self.Re ** (-1/2)
+                self.nu_disk = self.alpha * c.R.cgs.value * self.T / (2.3 * self.Omega)
+
+                self.kappa_i = self.kappa
+                self.Sigma_g_i = self.Sigma_g
+                """
+
+                # since dotQ_plus != 0 now, it won't be changed when T begins to vary
+                # dotQ_plus is only used for calculating dT, where Sigma_g is eliminated on both side
+                self.dotQ_plus = 2.25 * self.nu_disk * self.Omega**2  # * self.Sigma_g
+                self.warn(f"Derived dotQ_plus[/Sigma_g] = {self.dotQ_plus:.3e}.")
+
     def update_solids(self, dt):
         """ Update the particle distribution every time step if needed """
 
-        if self.closed_box_flag:  # we may use this to de-clutter other checks on this flag
-            return None
+        if self.closed_box_flag is False:
+            # first, calculate sigma loss due to accretion funnels
+            # this could be the last step; we keep it here to make results compatible with previous versions
+            self.Hratio_loss = 1 - torch.special.erf(self.inv_sqrt_2 / (self.H_d / self.H))
+            self.Hratio_loss[self.a > self.a_critD] = 0
+            self.dsigma_out = self.sigma / self.Sigma_g * self.Hratio_loss * self.Sigma_dot
+            if self.t < self.acc_ramp_time:  # False even if both = 0
+                acc_ramp_ratio = self.t / self.acc_ramp_time
+            else:
+                acc_ramp_ratio = 1.0
+            self.sigma -= torch.minimum(acc_ramp_ratio * self.dsigma_out * dt, self.sigma)
 
-        # first, calculate sigma loss due to accretion tunnels
-        self.Hratio_loss = 1 - torch.special.erf(self.inv_sqrt_2 / (self.H_d / self.H))
-        self.Hratio_loss[self.a > self.a_critD] = 0
-        self.dsigma_out = self.sigma / self.Sigma_g * self.Hratio_loss * self.Sigma_dot
+            # second, add dust supply from outer disk
+            # this step is performed beforehand so the supply also go through evaporation/condensation
+            self.sigma += acc_ramp_ratio * self.dsigma_in * dt
+            # alternatively, the amount of supply may be regulated by the simplified treatment below
+            # if self.dyn_env_flag and self.t >= self.dyn_env_burn_in and self.T > 2000:
+            # temp_fac = np.exp(-(self.T - 2000) / (2010 - 2000))
+            # self.sigma += self.dsigma_in * dt * temp_fac
 
-        self.sigma -= torch.minimum(self.dsigma_out * dt, self.sigma)
+            # update _Sigma_d that will be used in the third step
+            self.Nk = self.sigma / (3 * self.m)
+            self.Na = self.sigma / self.m
+            self._Sigma_d = torch.sum(self.sigma * self.dlog_a).item()
 
-        # second, add dust supply from outer disk
-        self.sigma += self.dsigma_in * dt
+        # third, calculate evaporation/condensation rate
+        if self.dyn_env_flag and self.t >= self.dyn_env_burn_in:
 
-        # update Nk and total surface density
-        self.Nk = self.sigma / (3 * self.m)
-        self.Na = self.sigma / self.m
-        self._Sigma_d = self.get_Sigma_d(self.Nk)
+            c_s_v = np.sqrt((self.cgs_k_B * self.T) / (self.cgs_mu * 60 / 2.3))
+            self.P_v_eq = self.P_v_eq0 * 10**(- self.T_a / self.T) * self.bar2cgs
+            R_e = 8 * self.sqrt_2_pi * self.a2_o_m / c_s_v * self.P_v_eq
+            R_c = 8 * c_s_v * self.a2_o_m / self.H
 
-    def _get_dN(self, dt):
+            if self.ev_explicit:
+                limited_dsigma_e = torch.minimum(R_e * self.sigma * dt, self.sigma)
+                dot_Sigma_v2c = torch.sum(R_c * self.sigma * self.dlog_a * self.Sigma_v).item()
+                if dot_Sigma_v2c * dt > self.Sigma_v:
+                    tmp_dt = 0.99 * self.Sigma_v / dot_Sigma_v2c  # use 0.99 to avoid numerical error on summation
+                    limited_dsigma_c = R_c * self.sigma * self.Sigma_v * tmp_dt
+                else:
+                    limited_dsigma_c = R_c * self.sigma * self.Sigma_v * dt
+                self.sigma += limited_dsigma_c - limited_dsigma_e
+                self.dSigma_e = torch.sum(limited_dsigma_e * self.dlog_a).item()
+                self.dSigma_c = torch.sum(limited_dsigma_c * self.dlog_a).item()
+                self.Sigma_v += self.dSigma_e - self.dSigma_c
+                self.log(f"dSigma_e = {self.dSigma_e:.4e}, dSigma_c = {self.dSigma_c:.4e}, "
+                         + f"Sigma_v = {self.Sigma_v}, Sigma_d = {torch.sum(self.sigma * self.dlog_a).item()}")
+
+            if self.ev_semi_implicit:   # ev = evaporation/condensation
+                R_c_prime = R_c * self.sigma * self.dlog_a
+                ev_idx_non0 = self.sigma > 0  # use indices so it works for discontinuous distributions
+                ev_non0 = torch.count_nonzero(ev_idx_non0).item()
+                ev_A = torch.zeros([ev_non0+2, ev_non0+1], dtype=self.default_dtype, device=self.device)
+                ev_B = torch.zeros(ev_non0+2, dtype=self.default_dtype, device=self.device)
+                old_Sigma_dv = self._Sigma_d + self.Sigma_v
+
+                ev_A[0, 0] = 1 + R_c_prime[ev_idx_non0].sum().item() * dt
+                ev_A[1:-1, 1:] = torch.diag_embed(1 + R_e[ev_idx_non0] * dt)
+                ev_A[0, 1:] = -R_e[ev_idx_non0] * dt
+                ev_A[1:-1, 0] = -R_c_prime[ev_idx_non0] * dt
+                ev_A[-1].fill_(100)  # use 100 to give more weight to mass conservation
+                ev_B[0] = self.Sigma_v
+                ev_B[1:-1] = self.sigma[ev_idx_non0] * self.dlog_a
+                ev_B[-1] = 100 * (self.Sigma_v + self._Sigma_d)
+
+                if True:
+                    _A = torch.clone(ev_A[:-1, :])
+                    if self._torch_113_flag:
+                        _A = _A.mT.contiguous().mT
+                    ev_sln = torch.linalg.solve(_A, ev_B[:-1])
+
+                    tmp_sigma = torch.zeros_like(self.sigma)
+                    tmp_sigma[ev_idx_non0] = ev_sln[1:] / self.dlog_a
+                    new_Sigma_dv = (torch.sum(tmp_sigma * self.dlog_a) + ev_sln[0]).item()
+                    tmp_rerr = abs((new_Sigma_dv - old_Sigma_dv) / old_Sigma_dv)
+                    if tmp_rerr > self.rerr_th:
+                        self.warn("Relative error is somewhat large in evaporation/condensation calculations: "
+                                  f"Cond(_A) = {torch.linalg.cond(_A):.3e}; "
+                                  f"Delta Sigma_d+v / Sigma_d+v = {tmp_rerr:.3e}. Consider using a smaller timestep.")
+                else:
+                    # it seems mass bins with tiny sigma would unphysically gain mass when using lstsq
+                    ev_sln = torch.linalg.lstsq(ev_A, ev_B)
+
+                    tmp_sigma = torch.zeros_like(self.sigma)
+                    tmp_sigma[ev_idx_non0] = ev_sln.solution[1:] / self.dlog_a
+                    new_Sigma_dv = (torch.sum(tmp_sigma * self.dlog_a) + ev_sln.solution[0]).item()
+                    tmp_rerr = abs((new_Sigma_dv - old_Sigma_dv) / old_Sigma_dv)
+                    if tmp_rerr > self.rerr_th4dt:
+                        self.log("weight for mass conservation adjusted to reduce relative error"
+                                 + "in evaporation/condensation calculations.")
+                        ev_A[-1].fill_(1000)
+                        ev_B[-1] = 1000 * (self.Sigma_v + self._Sigma_d)
+                        ev_sln = torch.linalg.lstsq(ev_A, ev_B)
+                        tmp_sigma[ev_idx_non0] = ev_sln.solution[1:] / self.dlog_a
+                        new_Sigma_dv = (torch.sum(tmp_sigma * self.dlog_a) + ev_sln.solution[0]).item()
+                        tmp_rerr = abs((new_Sigma_dv - old_Sigma_dv) / old_Sigma_dv)
+                    if tmp_rerr > self.rerr_th:
+                        self.warn("Relative error is somewhat large in evaporation/condensation calculations: "
+                                  f"Delta Sigma_d+v / Sigma_d+v = {tmp_rerr:.3e}. Consider using a smaller timestep.")
+
+                # deal with possible negative numbers (usually outside a_supp)
+                # also, set a surface density floor, so condensation is possible after almost all dust sublimates
+                if torch.any(tmp_sigma < 0):
+                    tmp_sigma[(tmp_sigma < 0) & (self.Nk == 0)] = 0  # if nothing was there, set to zero
+
+                    # tiny_idx = (tmp_sigma < 0) & (abs(tmp_sigma) / tmp_sigma.sum() < 1e-8)
+                    # The line above may fail if most solids have been vaporized such that tmp_sigma is already tiny
+                    # Instead, we use the total surface density (we adopt 1e-10 since lstsq gives limited accuracy)
+                    tiny_idx = (tmp_sigma < 0) & (torch.abs(tmp_sigma * self.dlog_a) / old_Sigma_dv < 1e-10)
+                    tmp_sigma[tiny_idx] = 0
+
+                # if there was something, set to surface density floor;
+                # such a floor corresponds to sigma(1e-4 cm) = 4.6e-03, Sigma_d ~ 0.001 g/cm^2 at 0.1 au
+                tiny_idx = (tmp_sigma == 0) & (self.a < 1e-2)
+                tmp_sigma[tiny_idx] = torch.maximum(tmp_sigma[tiny_idx],
+                                                    torch.scalar_tensor((old_Sigma_dv / self.dlog_a) * 1e-15))
+
+                new_Sigma_dv = (torch.sum(tmp_sigma * self.dlog_a) + ev_sln[0]).item()  #.solution
+                if torch.any(tmp_sigma < 0):
+                    self.warn("Negative sigma remains. Calculations may encounter problems.")
+
+                enforce_mass_con_ratio = old_Sigma_dv / new_Sigma_dv
+                self.Sigma_v = ev_sln[0].item() * enforce_mass_con_ratio  #.solution
+                self.sigma = tmp_sigma * enforce_mass_con_ratio
+                if self.Sigma_v < 0:
+                    self.warn("Vapor surface density becomes negative. Enforce it back to zero now. "
+                              + "Smaller timestep is recommended.")
+                    tmp_Sigma_d = torch.sum(self.sigma * self.dlog_a).item()
+                    enforce_mass_con_ratio = (tmp_Sigma_d + self.Sigma_v) / tmp_Sigma_d
+                    self.sigma *= enforce_mass_con_ratio
+                    self.Sigma_v = 0
+                # _Sigma_d hasn't updated yet (positive if evaporate more, negative if condense more)
+                self.dSigma_ec = self._Sigma_d - (old_Sigma_dv - self.Sigma_v)
+                #self.log(f"Sigma_v = {self.Sigma_v}, Sigma_d = {torch.sum(self.sigma * self.dlog_a).item()}")
+                self.dSigma_v2d = R_c_prime * dt * self.Sigma_v
+                self.dSigma_d2v = R_e * dt * self.sigma * self.dlog_a
+
+            # finally, update Nk and total surface density
+            self.Nk = self.sigma / (3 * self.m)
+            self.Na = self.sigma / self.m
+            self._Sigma_d = torch.sum(self.sigma * self.dlog_a).item()
+            if self.closed_box_flag is False and self.tmp_debug_flag is False:
+                # accrete Sigma_v accordingly
+                dSigma_v_acc = self.Sigma_v * (self.Sigma_dot * dt) / self.Sigma_g
+                self.Sigma_v -= min(dSigma_v_acc, self.Sigma_v)
+
+    def _get_dN_before_torch_1_13(self, dt):
         """ Get the current dN for debug use """
 
         self.S = self.Nk @ (self.Nk @ self.tM)  # M_ijk N_i N_j equals to M_jik N_i N_j
         self.J = self.Nk @ (self.tM + torch.swapaxes(self.tM, 0, 1))
         return torch.linalg.solve(self.I / dt - self.J.transpose(0, 1), self.S)
 
-    def _one_step_implicit(self, dt):
+    def _get_dN_after_torch_1_13(self, dt):
+        """ Get the current dN for debug use """
+
+        self.S = self.Nk @ (self.Nk @ self.tM)  # M_ijk N_i N_j equals to M_jik N_i N_j
+        self.J = self.Nk @ (self.tM + torch.swapaxes(self.tM, 0, 1))
+        _A = self.I / dt - self.J.transpose(0, 1)
+        _A = _A.mT.contiguous().mT  # see https://github.com/pytorch/pytorch/issues/90453
+        return torch.linalg.solve(_A, self.S)
+
+    def _one_step_implicit_before_torch_1_13(self, dt):
         """ Group matrix solving part for future optimization
 
         Notes: When mass grid spans more than 16 orders of magnitude, it gives ill-conditioned matrix warning
@@ -1454,12 +1778,19 @@ class RubbleTorch:
         self.J = self.Nk @ (self.tM + torch.swapaxes(self.tM, 0, 1))
         self.dN = torch.linalg.solve(self.I / dt - self.J.transpose(0, 1), self.S)
 
+    def _one_step_implicit_after_torch_1_13(self, dt):
+        self.S = self.Nk @ (self.Nk @ self.tM)  # M_ijk N_i N_j equals to M_jik N_i N_j
+        self.J = self.Nk @ (self.tM + torch.swapaxes(self.tM, 0, 1))
+        _A = self.I / dt - self.J.transpose(0, 1)
+        _A = _A.mT.contiguous().mT  # see https://github.com/pytorch/pytorch/issues/90453
+        self.dN = torch.linalg.solve(_A, self.S)
+
     def one_step_implicit(self, dt):
         """ Evolve the particle distribution for dt with one implicit step"""
 
-        # ultimately, kernels needs to be updated every time step due to the changes on Sigma_g, T, Pi, kappa, etc.
-        #if not self.static_kernel_flag:
+        #if self._Sigma_d == 0 and not self.static_kernel_flag:  # in case all solids become vapor
         #    self.update_kernels()
+        #    return None
 
         # if previous step successfully used dynamic dt, then continue using it
         # because it is likely that dyn_dt can work for a long time
@@ -1549,7 +1880,8 @@ class RubbleTorch:
         It is impossible to avoid rounding errors (see discussion in Garaud+2013).
         Here, we follow their method to enforce mass conservation but we enforce it every timestep.
         """
-
+        if self._Sigma_d == 0:  # in case all solids become vapor
+            return None
         self.Nk *= (self._Sigma_d / self.get_Sigma_d(self.Nk))
         self.sigma = self.Nk * 3 * self.m
         self.Na = self.Nk * 3
@@ -1559,8 +1891,7 @@ class RubbleTorch:
 
         self.one_step_implicit(dt)
         self.enforce_mass_con()
-        if not self.closed_box_flag:
-            self.update_solids(dt)
+        self.update_solids(dt)
 
     def dump_bin_data(self, first_dump=False, open4restart=False):
         """ Dump run data to a file """
@@ -1568,7 +1899,16 @@ class RubbleTorch:
         # not sure if this is the best practice if using GPU
         if first_dump:
             # self.dlog_a and self.t is np.float64, so res4out becomes np.float64
-            self.res4out = np.hstack([self.dlog_a, self.m.cpu().numpy(), self.a.cpu().numpy()])
+            if self.dyn_env_flag:
+                if self.debug_flag:
+                    self.res4out = np.hstack([self.dlog_a, self.m.cpu().numpy(), self.a.cpu().numpy(),
+                                              np.zeros(self.num_grid + 2), np.zeros(self.num_grid+2),
+                                              self.kappa, self.Sigma_g, self.Sigma_v, self.T])
+                else:
+                    self.res4out = np.hstack([self.dlog_a, self.m.cpu().numpy(), self.a.cpu().numpy(),
+                                          self.kappa, self.Sigma_g, self.Sigma_v, self.T])
+            else:
+                self.res4out = np.hstack([self.dlog_a, self.m.cpu().numpy(), self.a.cpu().numpy()])
             self.dat_file = open(self.dat_file_name, 'wb')
             self.dat_file.write(self.num_grid.to_bytes(4, 'little'))
             # for device='cpu', cpu() won't do anything, no copy
@@ -1576,11 +1916,21 @@ class RubbleTorch:
             self.dat_file.close()
             self.dat_file = open(self.dat_file_name, 'ab')
         else:
-            self.res4out = np.hstack([self.t, self.sigma.cpu().numpy(), self.Nk.cpu().numpy()])
+            if self.dyn_env_flag:
+                if self.debug_flag:
+                    self.res4out = np.hstack([self.t, self.sigma.cpu().numpy(), self.Nk.cpu().numpy(),
+                                              self.dSigma_v2d.cpu().numpy(), self.dSigma_d2v.cpu().numpy(),
+                                              self.kappa, self.Sigma_g, self.Sigma_v, self.T])
+                else:
+                    self.res4out = np.hstack([self.t, self.sigma.cpu().numpy(), self.Nk.cpu().numpy(),
+                                          self.kappa, self.Sigma_g, self.Sigma_v, self.T])
+            else:
+                self.res4out = np.hstack([self.t, self.sigma.cpu().numpy(), self.Nk.cpu().numpy()])
             self.dat_file.write(self.res4out.tobytes())
 
     def run(self, tlim, dt, out_dt, cycle_limit=1000000000,
-            burnin_dt=1/365.25, no_burnin=False, ramp_speed=1.01, dynamic_dt=False, out_log=True):
+            burnin_dt=1/365.25, no_burnin=False, burnin_out_dt_ratio=1.0,
+            ramp_speed=1.01, dynamic_dt=False, out_log=True):
         """
         Run simulations and dump results
 
@@ -1655,12 +2005,12 @@ class RubbleTorch:
         tmp_dt = burnin_dt
         if self.cycle_count == 0 and no_burnin is False:
             dt, burnin_dt = burnin_dt, dt
+            self.next_out_t = self.t + self.out_dt * burnin_out_dt_ratio
             while self.t + dt < min(tlim, 1) and self.cycle_count < cycle_limit:  # alternatively, we can use 4 yrs
                 pre_step_t = time.perf_counter()
                 self.one_step_implicit(dt * self.s2y)
                 self.enforce_mass_con()
-                if not self.closed_box_flag:
-                    self.update_solids(self.dt * self.s2y)  # dt could have changed
+                self.update_solids(self.dt * self.s2y)  # dt could have changed
                 self.t += self.dt
                 self.cycle_count += 1
                 post_step_t = time.perf_counter()
@@ -1670,7 +2020,7 @@ class RubbleTorch:
                     fh.flush()
                 if self.t > self.next_out_t - dt / 2:
                     dump_func()
-                    self.next_out_t = self.t + self.out_dt
+                    self.next_out_t = self.t + self.out_dt * burnin_out_dt_ratio
             dt, burnin_dt = burnin_dt, dt
 
             if ramp_speed <= 1.0 or ramp_speed >= 5:
@@ -1684,8 +2034,7 @@ class RubbleTorch:
                 pre_step_t = time.perf_counter()
                 self.one_step_implicit(tmp_dt * self.s2y)
                 self.enforce_mass_con()
-                if not self.closed_box_flag:
-                    self.update_solids(self.dt * self.s2y)  # dt could have changed
+                self.update_solids(self.dt * self.s2y)  # dt could have changed
                 self.t += self.dt
                 self.cycle_count += 1
                 post_step_t = time.perf_counter()
@@ -1695,7 +2044,7 @@ class RubbleTorch:
                     fh.flush()
                 if self.t > self.next_out_t - tmp_dt / 2:
                     dump_func()
-                    self.next_out_t = self.t + self.out_dt
+                    self.next_out_t = self.t + self.out_dt * burnin_out_dt_ratio
 
         # turn on dynamic dt if specified
         if dynamic_dt:
@@ -1712,8 +2061,7 @@ class RubbleTorch:
                         pre_step_t = time.perf_counter()
                         self.one_step_implicit(tmp_dt * self.s2y)
                         self.enforce_mass_con()
-                        if not self.closed_box_flag:
-                            self.update_solids(self.dt * self.s2y)  # dt could have changed
+                        self.update_solids(self.dt * self.s2y)  # dt could have changed
                         self.t += self.dt
                         self.cycle_count += 1
                         post_step_t = time.perf_counter()
@@ -1739,8 +2087,7 @@ class RubbleTorch:
             pre_step_t = time.perf_counter()
             self.one_step_implicit(dt * self.s2y)
             self.enforce_mass_con()
-            if not self.closed_box_flag:
-                self.update_solids(self.dt * self.s2y)  # dt could have changed
+            self.update_solids(self.dt * self.s2y)  # dt could have changed
             self.t += self.dt
             self.cycle_count += 1
             post_step_t = time.perf_counter()
@@ -1764,8 +2111,7 @@ class RubbleTorch:
             pre_step_t = time.perf_counter()
             self.one_step_implicit(dt * self.s2y)
             self.enforce_mass_con()
-            if not self.closed_box_flag:
-                self.update_solids(self.dt * self.s2y)  # dt could have changed
+            self.update_solids(self.dt * self.s2y)  # dt could have changed
             self.t += self.dt
             self.cycle_count += 1
             post_step_t = time.perf_counter()

@@ -6,6 +6,7 @@ import numpy as np
 import copy
 sys.path.append("..")
 from rubble.rubble import Rubble
+from rubble.rubble_torch import RubbleTorch
 from rubble.rubble_data import RubbleData
 
 class BasicTestSuite(unittest.TestCase):

@@ -57,10 +57,10 @@ class RubbleData:
     """ Read in simulation data for further analyses """
 
     def __init__(self, filename, data_format='bin',
-                 chop=True, chop_thresh=1e-200):
+                 chop=True, chop_thresh=1e-200, dyn_env=False, debug_flag=False):
         """
         Read in simulation data for further analyses
-        
+
         Parameters
         ----------
         filename : str
@@ -74,36 +74,51 @@ class RubbleData:
             choose the threshold for chopping (default=1e-200,
             i.e., any number below 1e-200 will be replaced by 0)
         """
-        
+
+        self.dyn_env_flag = dyn_env
         if data_format == 'bin':
             f = open(filename, 'rb')
             self.Ng = readbin(f, 'i')
             pos_i = f.tell()
             f.seek(0, 2)
             num_bytes = f.tell() - pos_i
-            num_rows = num_bytes // 8 // (self.Ng * 2 + 5)
-            if num_rows * 8 * (self.Ng * 2 + 5) > num_bytes:
+            num_cols = (self.Ng + 2) * 2 + 1  # 2 ghost zones, extra 1 is time
+            if dyn_env:
+                num_cols += 4
+                if debug_flag:
+                    num_cols += (self.Ng + 2) * 2
+            num_rows = num_bytes // 8 // num_cols
+            if num_rows * 8 * num_cols > num_bytes:
                 raise IOError(f"The number of bytes seems off: Ng={self.Ng}, "
                               + f"num_rows={num_rows}, num_bytes={num_bytes}")
-            elif num_rows * 8 * (self.Ng * 2 + 5) < num_bytes:
+            elif num_rows * 8 * num_cols < num_bytes:
                 print(f"Bytes more than data: Ng={self.Ng}, num_rows={num_rows}, num_bytes={num_bytes}"
                       f"\nreading anyway")
                 num_rows -= 1
+                num_bytes = num_rows * num_cols * 8
             else:
                 pass
 
             f.seek(4, 0)
-            data = loadbin(f, num=num_bytes // 8).reshape([num_rows, self.Ng * 2 + 5])
+            data = loadbin(f, num=num_bytes // 8).reshape([num_rows, num_cols])
             f.close()
 
             self.Ng += 2  # !! use Ng+2 in fact
             self.m = data[0][1:self.Ng + 1]
-            self.a = data[0][self.Ng + 1:]
+            self.a = data[0][self.Ng + 1:2*self.Ng + 1]
             self.t = data[1:, 0]
             self.dlog_m = np.diff(np.log10(self.m)).mean()
             self.dlog_a = np.diff(np.log10(self.a)).mean()
             self.sigma = data[1:, 1:self.Ng + 1]
-            self.Nk = data[1:, self.Ng + 1:]
+            self.Nk = data[1:, self.Ng+1:2*self.Ng+1]
+            if dyn_env:
+                if debug_flag:
+                    self.dSigma_v2d = data[1:, 2*self.Ng+1:3*self.Ng+1]
+                    self.dSigma_d2v = data[1:, 3*self.Ng+1:4*self.Ng+1]
+                self.kappa = data[1:, -4]
+                self.Sigma_g = data[1:, -3]
+                self.Sigma_v = data[1:, -2]
+                self.T = data[1:, -1]
             if chop:
                 chop_idx = self.sigma < chop_thresh
                 self.Nk[chop_idx] = 0
@@ -146,7 +161,7 @@ class RubbleData:
 
     def add_mass_axis(self, ax, offset=-0.175):
         """ Add a mass axis below the x-axis which illustrate size """
-        
+
         tmp_ax = ax.twiny(); tmp_ax.xaxis.set_ticks_position("bottom")
         tmp_ax.xaxis.set_label_position("bottom")
         tmp_ax.spines["bottom"].set_position(("axes", offset))
@@ -314,13 +329,22 @@ class RubbleData:
 
         self.new_dat_file = open(filename, 'wb')
         self.new_dat_file.write((self.Ng-2).to_bytes(4, 'little'))
-        self.res4out = np.hstack([self.dlog_a, self.m, self.a])
-        self.new_dat_file.write(self.res4out.tobytes())
+
+        if self.dyn_env_flag:
+            res4out = np.hstack([self.dlog_a, self.m, self.a,
+                                 self.kappa[0], self.Sigma_g[0], self.Sigma_v[0], self.T[0]])
+        else:
+            res4out = np.hstack([self.dlog_a, self.m, self.a])
+        self.new_dat_file.write(res4out.tobytes())
 
         for i, t in enumerate(self.t):
             if i <= keep_first_n or i % sampling_rate == 0:
-                self.res4out = np.hstack([t, self.sigma[i], self.Nk[i]])
-                self.new_dat_file.write(self.res4out.tobytes())
+                if self.dyn_env_flag:
+                    res4out = np.hstack([t, self.sigma[i], self.Nk[i],
+                                         self.kappa[i], self.Sigma_g[i], self.Sigma_v[i], self.T[i]])
+                else:
+                    res4out = np.hstack([t, self.sigma[i], self.Nk[i]])
+                self.new_dat_file.write(res4out.tobytes())
 
         self.new_dat_file.close()
 
