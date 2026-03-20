@@ -53,6 +53,8 @@ class Rubble:
     #                    See notes in method _calculate_St for more details.
     legacy_parRe_flag = FlagProperty("legacy_parRe_flag",
                                      "to use 2*a*dv(a, amin)/nu_mol as the particle Reynolds number; default: False")
+    windmark_flag = FlagProperty("windmark_flag",
+                                 "to use Windmark+2012 mass-dependent collision model; default: False")
 
     """ methods """
 
@@ -144,6 +146,39 @@ class Rubble:
         self.St_12 = 0                                                 # particles below this are tightly-coupled
         self.eps_tot = 0.01                                            # total midplane dust-to-gas density ratio
         self.FB_eps_cap = 100                                          # max eps to cap the feedback effects
+
+        # Windmark+2012 collision model parameters (only used when windmark_flag=True)
+        # REFs: Windmark, Birnstiel, Ormel & Dullemond, A&A 540, A73 (2012) [W12a]
+        #       Windmark, Birnstiel, Ormel & Dullemond, A&A 544, L16  (2012) [W12b]
+        # sticking/bouncing thresholds: dv_stick = (m_p/m_s)^{-5/18} [cm/s], Eq. 1-2 in W12a
+        self.W12_m_s = self.kwargs.get('W12_m_s', 3.0e-12)             # sticking normalizing mass [g]
+        self.W12_m_b = self.kwargs.get('W12_m_b', 3.3e-3)              # bouncing normalizing mass [g]
+        # fragmentation: v_mu = (m/m_mu)^{-gamma} [cm/s], Eq. 7 in W12a
+        self.W12_gamma = self.kwargs.get('W12_gamma', 0.16)            # frag threshold exponent
+        self.W12_m_10 = self.kwargs.get('W12_m_10', 3.67e7)            # frag onset mass [g] (mu=1.0)
+        self.W12_m_05 = self.kwargs.get('W12_m_05', 9.49e11)           # half-mass frag mass [g] (mu=0.5)
+        # largest remnant fraction: mu(m,v) = C * m^alpha * v^beta, Eq. 8-10 in W12a
+        self.W12_mu_alpha = np.log(2) / np.log(self.W12_m_10 / self.W12_m_05)  # = -0.068
+        self.W12_mu_beta = self.W12_mu_alpha / self.W12_gamma                   # = -0.43
+        self.W12_mu_C = self.W12_m_10 ** (-self.W12_mu_alpha)                   # = 3.27 [g^{-alpha}]
+        # mass transfer efficiency: eps_ac = a_coeff + b_coeff * (v_{1.0,beitz}/v_{1.0}) * dv, Eq. 13 in W12a
+        self.W12_eps_ac_a = self.kwargs.get('W12_eps_ac_a', -6.8e-3)   # intercept
+        self.W12_eps_ac_b = self.kwargs.get('W12_eps_ac_b', 2.8e-4)    # slope [s/cm]
+        self.W12_eps_ac_min = self.kwargs.get('W12_eps_ac_min', 0.0)    # min accretion efficiency (floor)
+        self.W12_eps_ac_max = self.kwargs.get('W12_eps_ac_max', 0.5)   # max accretion efficiency
+        self.W12_v10_beitz = 13.0                                      # frag onset for 4.1g particles [cm/s]
+        # erosion: m_er/m_p = a * (m_p/m_0)^k * dv + b, Eq. 15 in W12a (calibrated by Teiser & Wurm)
+        self.W12_ero_a = self.kwargs.get('W12_ero_a', 1.1e-5)          # erosion coefficient
+        self.W12_ero_b = self.kwargs.get('W12_ero_b', -0.4)            # erosion offset
+        self.W12_ero_k = self.kwargs.get('W12_ero_k', 0.15)            # erosion mass exponent
+        self.W12_m_0 = self.kwargs.get('W12_m_0', 3.5e-12)             # monomer mass [g]
+        # fragment power-law index: n(m)dm propto m^{-kappa} dm, Eq. 16 in W12a
+        self.W12_kappa = self.kwargs.get('W12_kappa', 9/8)             # = 1.125
+        # sticking-to-bouncing transition constants, Eq. 22-23 in W12a
+        # p_c = 1 - k1 * log10(dv) - k2, with k2 mass-dependent (computed per pair)
+        self.W12_k1 = (18.0 / 5) / np.log10(self.W12_m_b / self.W12_m_s)  # = 0.40
+        self.W12_log_ms = np.log10(self.W12_m_s)
+        self.W12_log_mb_over_ms = np.log10(self.W12_m_b / self.W12_m_s)
 
         # some constants
         self.sqrt_2_pi = np.sqrt(2 * np.pi)
@@ -271,6 +306,7 @@ class Rubble:
         self.closed_box_flag = self.kwargs.get('CB', True)             # to use a closed box (so no loss/supply)
         self.dyn_env_flag = self.kwargs.get('dyn_env', False)          # to consider non-static gas disk environment
         self.legacy_parRe_flag = self.kwargs.get("legacy_parRe", False)  # to use legacy particle Reynolds number
+        self.windmark_flag = self.kwargs.get("windmark", False)        # to use Windmark+2012 collision model
         self.tmp_debug_flag = self.kwargs.get("tmp_debug", False)
 
         """ Step 6, prepare coefficients and more initializations """
@@ -953,6 +989,228 @@ class Rubble:
         self.fac1_vd = np.sqrt(54 / torch.pi) / 3
         self.fac2_vd = np.sqrt(1.5)
 
+    def _windmark_compute_outcomes(self):
+        """ Compute Windmark+2012 collision outcomes: mass-dependent thresholds, mu, eps_ac, m_er
+
+        This method computes 2D tensors (indexed by [i,j]) that characterize the collision outcome
+        for each particle pair based on the center-of-mass energy division scheme.
+
+        REFs: Windmark, Birnstiel, Ormel & Dullemond, A&A 540, A73 (2012)
+        """
+
+        # projectile = min(m_i, m_j), target = max(m_i, m_j)
+        m_p_ij = torch.minimum(self.m_i, self.m_j)
+        m_t_ij = torch.maximum(self.m_i, self.m_j)
+
+        # mass-dependent sticking and bouncing thresholds, Eq. 1-2 in W12a
+        # dv_stick = (m_p / m_s)^{-5/18} [cm/s]
+        # dv_bounce = (m_p / m_b)^{-5/18} [cm/s]
+        self._W12_dv_stick = (m_p_ij / self.W12_m_s) ** (-5.0 / 18)
+        self._W12_dv_bounce = (m_p_ij / self.W12_m_b) ** (-5.0 / 18)
+
+        # center-of-mass velocities, Eq. 3-4 in W12a
+        # v_p = dv / (1 + m_p/m_t), v_t = dv / (1 + m_t/m_p)
+        v_p = self.dv / (1 + m_p_ij / m_t_ij)
+        v_t = self.dv / (1 + m_t_ij / m_p_ij)
+
+        # largest remnant fraction for each particle, Eq. 8 in W12a
+        # mu(m,v) = C * m^alpha * v^beta, where v is center-of-mass velocity
+        # mu >= 1 means the particle is intact; mu < 1 means it fragments
+        # clamp v_p, v_t to avoid zero-velocity issues (mu -> inf when v -> 0)
+        v_p_safe = torch.clamp(v_p, min=1e-30)
+        v_t_safe = torch.clamp(v_t, min=1e-30)
+        self._W12_mu_p = self.W12_mu_C * m_p_ij ** self.W12_mu_alpha * v_p_safe ** self.W12_mu_beta
+        self._W12_mu_t = self.W12_mu_C * m_t_ij ** self.W12_mu_alpha * v_t_safe ** self.W12_mu_beta
+        # clamp mu to [0, some large value] -- values >= 1 mean intact
+        self._W12_mu_p = torch.clamp(self._W12_mu_p, min=0)
+        self._W12_mu_t = torch.clamp(self._W12_mu_t, min=0)
+
+        # fragmentation threshold velocity for the projectile mass, Eq. 7 in W12a
+        # v_{1.0} = (m_p / m_{1.0})^{-gamma}
+        v10_p = (m_p_ij / self.W12_m_10) ** (-self.W12_gamma)
+
+        # mass transfer accretion efficiency, Eq. 13 in W12a
+        # eps_ac = a + b * (v_{1.0,beitz} / v_{1.0}) * dv
+        self._W12_eps_ac = (self.W12_eps_ac_a
+                            + self.W12_eps_ac_b * (self.W12_v10_beitz / v10_p) * self.dv)
+        self._W12_eps_ac = torch.clamp(self._W12_eps_ac, min=self.W12_eps_ac_min, max=self.W12_eps_ac_max)
+
+        # erosion mass ratio, Eq. 15 in W12a (calibrated by Teiser & Wurm 2009)
+        # m_er / m_p = a * (m_p / m_0)^k * dv + b
+        self._W12_ero_ratio = (self.W12_ero_a * (m_p_ij / self.W12_m_0) ** self.W12_ero_k * self.dv
+                               + self.W12_ero_b)
+        self._W12_ero_ratio = torch.clamp(self._W12_ero_ratio, min=0)
+
+    def _windmark_fragmentation_coeff(self):
+        """ Compute gF/lF using Windmark+2012 velocity+mass dependent collision outcomes
+
+        Uses mu_p, mu_t (largest remnant fractions), eps_ac (mass transfer efficiency),
+        and m_er (erosion) computed by _windmark_compute_outcomes() to build the 3D
+        fragmentation gain (gF) and loss (lF) coefficient tensors.
+
+        Fragment distribution follows n(m)dm propto m^{-kappa} dm with kappa = 9/8.
+        Each fragmenting particle produces a largest remnant of mass mu*m and a power-law
+        tail containing (1-mu)*m of mass.
+
+        REFs: Windmark, Birnstiel, Ormel & Dullemond, A&A 540, A73 (2012), Sect. 3.4-3.5
+        """
+
+        self.gF.fill_(0)
+        self.lF.fill_(1)
+
+        N = self.num_grid + 2
+
+        # ----- base fragment distribution (velocity-independent, cached) -----
+        # frag_Nk[i, k]: how unit mass of particle i is distributed to bin k when fully fragmented
+        # using W12 power-law index kappa = 9/8 (different from the default xi = 1.83)
+        if not hasattr(self, '_W12_frag_Nk'):
+            C_norm = torch.zeros_like(self.a)
+            tmp_Nk = torch.tril(self.m_j ** (-self.W12_kappa + 1), -1)
+            C_norm[1:] = self.m[1:] / torch.sum(tmp_Nk * self.m_j, 1)[1:]
+            self._W12_frag_Nk = tmp_Nk * C_norm[:, None]  # frag_Nk[i, k] for k < i
+        frag_Nk = self._W12_frag_Nk
+
+        # ----- 2D collision outcome tensors -----
+        mu_p = self._W12_mu_p  # [N, N]
+        mu_t = self._W12_mu_t  # [N, N]
+        eps_ac = self._W12_eps_ac  # [N, N]
+        ero_ratio = self._W12_ero_ratio  # [N, N]
+
+        # map mu_p/mu_t (defined for projectile=min, target=max) back to particle indices i and j
+        # _W12_mu_p is always the mu of the smaller particle (projectile)
+        # _W12_mu_t is always the mu of the larger particle (target)
+        # when m_i >= m_j (j is projectile): mu_of_i = mu_t, mu_of_j = mu_p
+        # when m_i <  m_j (i is projectile): mu_of_i = mu_p, mu_of_j = mu_t
+        i_ge_j = self.m_i >= self.m_j  # [N, N]
+        mu_i = torch.where(i_ge_j, mu_t, mu_p)  # mu for particle i
+        mu_j = torch.where(i_ge_j, mu_p, mu_t)  # mu for particle j
+
+        # collision type masks [N, N]
+        proj_frags = mu_p < 1  # projectile fragments
+        targ_frags = mu_t < 1  # target fragments
+        is_frag = proj_frags & targ_frags  # destructive: both fragment
+        is_MT = proj_frags & (~targ_frags)  # mass transfer: only projectile fragments
+
+        mesh3D_i, mesh3D_j, mesh3D_k = torch.meshgrid(self.idx_grid, self.idx_grid, self.idx_grid, indexing='ij')
+
+        # ===== Case 1: Destructive fragmentation (both particles fragment) =====
+        # each particle produces: largest remnant (mu*m) + power-law tail ((1-mu)*m)
+        is_frag_3d = is_frag[mesh3D_i, mesh3D_j]
+        mu_i_3d = mu_i[mesh3D_i, mesh3D_j]
+        mu_j_3d = mu_j[mesh3D_i, mesh3D_j]
+
+        # -- power-law from particle i: bins k < i --
+        idx_i_pw = is_frag_3d & (mesh3D_k < mesh3D_i)
+        self.gF[idx_i_pw] = (frag_Nk[mesh3D_i[idx_i_pw], mesh3D_k[idx_i_pw]]
+                              * (1 - mu_i_3d[idx_i_pw]))
+        # -- power-law from particle j: bins k < j --
+        idx_j_pw = is_frag_3d & (mesh3D_k < mesh3D_j)
+        self.gF[idx_j_pw] += (frag_Nk[mesh3D_j[idx_j_pw], mesh3D_k[idx_j_pw]]
+                               * (1 - mu_j_3d[idx_j_pw]))
+
+        # -- remnant placement --
+        m_rem_i = mu_i * self.m[:, None]  # [N, N]
+        m_rem_j = mu_j * self.m[None, :]  # [N, N]
+        k_rem_i = torch.searchsorted(self.m, m_rem_i.reshape(-1)).reshape(N, N).clamp(0, N - 1)
+        k_rem_j = torch.searchsorted(self.m, m_rem_j.reshape(-1)).reshape(N, N).clamp(0, N - 1)
+
+        frag_ij = is_frag.nonzero(as_tuple=False)
+        if frag_ij.shape[0] > 0:
+            fi, fj = frag_ij[:, 0], frag_ij[:, 1]
+            ki = k_rem_i[fi, fj]
+            self.gF[fi, fj, ki] += mu_i[fi, fj] * self.m[fi] / self.m[ki]
+            kj = k_rem_j[fi, fj]
+            self.gF[fi, fj, kj] += mu_j[fi, fj] * self.m[fj] / self.m[kj]
+
+        # ===== Case 2: Mass transfer (only projectile fragments, target intact) =====
+        # projectile fragments: (1 - eps_ac) goes to fragments (remnant + power-law), eps_ac goes to target
+        # target may also be eroded: m_er is removed from target and distributed as fragments
+        is_MT_3d = is_MT[mesh3D_i, mesh3D_j]
+        eps_ac_3d = eps_ac[mesh3D_i, mesh3D_j]
+        mu_p_3d = mu_p[mesh3D_i, mesh3D_j]
+        i_ge_j_3d = i_ge_j[mesh3D_i, mesh3D_j]
+
+        # projectile index for each (i,j,k)
+        proj_idx = torch.where(i_ge_j_3d, mesh3D_j, mesh3D_i)
+
+        # -- projectile power-law fragments: (1-eps_ac)*(1-mu_p) fraction, bins k < proj_idx --
+        idx_MT_pw = is_MT_3d & (mesh3D_k < proj_idx)
+        if idx_MT_pw.any():
+            pk = proj_idx[idx_MT_pw]
+            self.gF[idx_MT_pw] += (frag_Nk[pk, mesh3D_k[idx_MT_pw]]
+                                   * (1 - eps_ac_3d[idx_MT_pw])
+                                   * (1 - mu_p_3d[idx_MT_pw]))
+
+        # -- projectile remnant and eroded mass from target --
+        MT_ij = is_MT.nonzero(as_tuple=False)
+        if MT_ij.shape[0] > 0:
+            mi_mt, mj_mt = MT_ij[:, 0], MT_ij[:, 1]
+            proj_is_j = i_ge_j[mi_mt, mj_mt]
+            m_proj = torch.where(proj_is_j, self.m[mj_mt], self.m[mi_mt])
+            m_targ = torch.where(proj_is_j, self.m[mi_mt], self.m[mj_mt])
+
+            mu_p_mt = mu_p[mi_mt, mj_mt]
+            eps_ac_mt = eps_ac[mi_mt, mj_mt]
+            ero_r_mt = ero_ratio[mi_mt, mj_mt]
+
+            # projectile remnant: mu_p * (1 - eps_ac) * m_proj
+            m_rem_proj = mu_p_mt * (1 - eps_ac_mt) * m_proj
+            k_rem_proj = torch.searchsorted(self.m, m_rem_proj).clamp(0, N - 1)
+            self.gF[mi_mt, mj_mt, k_rem_proj] += (mu_p_mt * (1 - eps_ac_mt)
+                                                    * m_proj / self.m[k_rem_proj])
+
+            # accreted mass onto target: eps_ac * m_proj added to target bin
+            targ_idx_mt = torch.where(proj_is_j, mi_mt, mj_mt)
+            self.gF[mi_mt, mj_mt, targ_idx_mt] += eps_ac_mt * m_proj / self.m[targ_idx_mt]
+
+            # eroded mass from target: distributed as power-law using frag_Nk[k_er_max]
+            # vectorized: for each MT pair, the erosion fragments follow frag_Nk[k_er_max, :]
+            # but we need to normalize so total eroded mass = m_er for each pair
+            m_er = ero_r_mt * m_proj  # [P]
+            k_er_max = torch.searchsorted(self.m, m_er).clamp(0, N - 1)  # [P]
+
+            # gather the fragment distribution for each pair's k_er_max
+            er_dist_all = frag_Nk[k_er_max]  # [P, N]
+            # zero out bins k >= k_er_max for each pair
+            k_range = torch.arange(N, device=self.device)  # [N]
+            er_dist_all = er_dist_all * (k_range[None, :] < k_er_max[:, None])  # [P, N]
+            # normalize: total mass in distribution = sum(er_dist * m)
+            er_total = (er_dist_all * self.m[None, :]).sum(dim=1)  # [P]
+            # scale factor: m_er / er_total, avoid div by zero
+            valid = (er_total > 0) & (m_er > 0) & (k_er_max > 0)
+            scale = torch.zeros_like(m_er)
+            scale[valid] = m_er[valid] / er_total[valid]
+            # add to gF: gF[mi_mt[p], mj_mt[p], k] += scaled_er[p, k]
+            scaled_er = er_dist_all * scale[:, None]  # [P, N]
+            # expand indices to [P, N] for scatter-add into 3D gF
+            P = MT_ij.shape[0]
+            ii_exp = mi_mt[:, None].expand(P, N)  # [P, N]
+            jj_exp = mj_mt[:, None].expand(P, N)  # [P, N]
+            kk_exp = k_range[None, :].expand(P, N)  # [P, N]
+            nonzero = scaled_er != 0
+            if nonzero.any():
+                self.gF.index_put_((ii_exp[nonzero], jj_exp[nonzero], kk_exp[nonzero]),
+                                   scaled_er[nonzero], accumulate=True)
+
+        # ===== loss coefficient lF =====
+        # destructive frag: both particles lose all mass -> lF = 1 (default on j==k diagonal)
+        # mass transfer: projectile loses all mass (lF=1), target loses m_er
+        if MT_ij.shape[0] > 0:
+            targ_idx = torch.where(proj_is_j, mi_mt, mj_mt)
+            frac_loss = ero_r_mt * m_proj / m_targ
+            self.lF[mi_mt, mj_mt, targ_idx] = frac_loss
+
+        # standard cleanup
+        self.lF[self.idx_jk_diff] = 0
+        self.lF[self.idx_ij_same] *= 0.5
+
+        # halve gF for i==j collisions
+        self.gF[self.idx_ij_same][self.gF[self.idx_ij_same] == 0.0] = 1.0
+        self.gF[self.idx_ij_same] *= 0.5
+
+        if self.device.type == 'cuda':
+            torch.cuda.empty_cache()
+
     def calculate_kernels(self):
         """ Calculate the kernel for coagulation and fragmentation (ghost zones only takes mass)
 
@@ -960,7 +1218,17 @@ class Rubble:
         """
 
         # localize variables for simplicity and improve readability
-        u_b, u_f = self.u_b, self.u_f
+        if self.windmark_flag:
+            # Windmark+2012: mass-dependent thresholds (2D tensors)
+            # In W12, sticking is below dv_stick, bouncing between dv_stick and dv_bounce,
+            # and fragmentation/mass-transfer is determined by mu above dv_bounce.
+            # For the probability computation, we map:
+            #   u_b -> dv_stick (below which 100% sticking)
+            #   u_f -> dv_bounce (above which fragmentation/MT occurs)
+            u_b = self._W12_dv_stick
+            u_f = self._W12_dv_bounce
+        else:
+            u_b, u_f = self.u_b, self.u_f
 
         if self.vel_dist_flag:
             # we can push a bit further to include the velocity distribution (Windmark+ A&A 544, L16 (2012))
@@ -991,11 +1259,25 @@ class Rubble:
             p_f = torch.zeros_like(self.m_j)                           # set all to zero
             p_f[self.dv > u_f] = 1.0                                   # set where du_ij > u_f to 1
             p_f_mask = (self.dv > soften_u_f) & (self.dv < u_f)
-            p_f[p_f_mask] = 1 - (u_f - self.dv[p_f_mask]) / delta_u  # set else values
+            if self.windmark_flag:
+                # u_f and delta_u are 2D tensors, need to index them by the same mask
+                p_f[p_f_mask] = 1 - (u_f[p_f_mask] - self.dv[p_f_mask]) / delta_u[p_f_mask]
+            else:
+                p_f[p_f_mask] = 1 - (u_f - self.dv[p_f_mask]) / delta_u  # set else values
 
             if self.bouncing_flag:
                 p_c = torch.zeros_like(self.m_j)
                 p_c[self.dv < u_b] = 1.0
+                if self.windmark_flag:
+                    # Windmark+2012 Eq. 22-23: logarithmic sticking-to-bouncing transition
+                    # p_c = 1 - k1 * log10(dv) - k2, for dv_stick < dv < dv_bounce
+                    # k2 = log10(m_p / m_s) / log10(m_b / m_s), depends on projectile mass
+                    m_p_ij = torch.minimum(self.m_i, self.m_j)
+                    k2 = (torch.log10(m_p_ij) - self.W12_log_ms) / self.W12_log_mb_over_ms
+                    trans_mask = (self.dv >= u_b) & (self.dv < u_f)
+                    dv_safe = torch.clamp(self.dv, min=1e-30)
+                    p_c_trans = 1 - self.W12_k1 * torch.log10(dv_safe) - k2
+                    p_c[trans_mask] = p_c_trans[trans_mask].clamp(0, 1)
             else:
                 p_c = 1 - p_f
 
@@ -1032,6 +1314,18 @@ class Rubble:
         else:
             raise ValueError(f"uni_gz_flag must be one of: True (both gz active), False (both gz inactive), "
                              f"2 (active left gz + inactive right gz), or 3 (inactive left gz + active right gz).")
+
+        # Windmark+2012: when both particles survive (mu_p >= 1 and mu_t >= 1),
+        # the collision is bouncing, not fragmentation — move p_f to p_b for those pairs
+        if self.windmark_flag:
+            both_intact = (self._W12_mu_p >= 1) & (self._W12_mu_t >= 1)
+            self.p_b[both_intact] += self.p_f[both_intact]
+            self.p_f[both_intact] = 0
+
+        # clamp probabilities to avoid tiny negatives from numerical noise (e.g., in erf computation)
+        self.p_c.clamp_(min=0)
+        self.p_f.clamp_(min=0)
+        self.p_b.clamp_(min=0)
 
         # Note: since K is symmetric, K.T = K, and dot(K_{ik}, n_i) = dot(K_{ki}, n_i) = dot(n_i, K_{ik})
         # kernel = self.dv * self.geo_cs                               # general kernel = du_ij * geo_cs
@@ -1095,7 +1389,7 @@ class Rubble:
     def _update_kernels(self, update_coeff=False):
 
         if self.f_mod_flag is True and self.feedback_flag is False and self.dyn_env_flag is False \
-                and self.cycle_count > 0:
+                and self.windmark_flag is False and self.cycle_count > 0:
             # use the modulation function to limit the interactions between mass bins that have low particle numbers
             # if w/o feedback effects, we don't need to go through the entire update_kernels procedure, only new f_mod
             # and new tM are needed. Thus, we squeeze them here
@@ -1205,7 +1499,11 @@ class Rubble:
         self.h_ss_ij = self.H_d ** 2 + self.H_d[:, None] ** 2
         self.vi_fac = torch.sqrt(2 * torch.pi * self.h_ss_ij)
 
-        if update_coeff:
+        if self.windmark_flag:
+            # Windmark+2012: recompute velocity-dependent outcomes and gF/lF every kernel update
+            self._windmark_compute_outcomes()
+            self._windmark_fragmentation_coeff()
+        elif update_coeff:
             # currently, no flag requires updateing coagulation coeff
             # self.piecewise_coagulation_coeff()
             self.gF.fill_(0)  # reset the gain coeff
@@ -1220,7 +1518,7 @@ class Rubble:
         """ Update collisional kernels """
 
         if self.f_mod_flag is True and self.feedback_flag is False and self.dyn_env_flag is False \
-                and self.cycle_count > 0:
+                and self.windmark_flag is False and self.cycle_count > 0:
             # use the modulation function to limit the interactions between mass bins that have low particle numbers
             # if w/o feedback effects, we don't need to go through the entire update_kernels procedure, only new f_mod
             # and new tM are needed. Thus, we squeeze them here
@@ -1335,7 +1633,10 @@ class Rubble:
         self.h_ss_ij = self.H_d ** 2 + self.H_d[:, None] ** 2
         self.vi_fac = torch.sqrt(2 * torch.pi * self.h_ss_ij)
 
-        if update_coeff:
+        if self.windmark_flag:
+            self._windmark_compute_outcomes()
+            self._windmark_fragmentation_coeff()
+        elif update_coeff:
             # currently, no flag requires updateing coagulation coeff
             # self.piecewise_coagulation_coeff()
             self.gF.fill_(0)  # reset the gain coeff
@@ -1350,8 +1651,9 @@ class Rubble:
         """ Update flag-dependent kernels whenever a flag changes """
 
         if self.flag_activated:
-            if flag_name in ["f_mod_flag", "feedback_flag", "dyn_env_flag"]:
-                if self.f_mod_flag is True or self.feedback_flag is True or self.dyn_env_flag is True:
+            if flag_name in ["f_mod_flag", "feedback_flag", "dyn_env_flag", "windmark_flag"]:
+                if (self.f_mod_flag is True or self.feedback_flag is True
+                        or self.dyn_env_flag is True or self.windmark_flag is True):
                     self.static_kernel_flag = False
                 else:
                     self.static_kernel_flag = True
@@ -1379,7 +1681,7 @@ class Rubble:
             if self.legacy_parRe_flag is True:
                 self.__init_calculate_St()
             # finally, update kernels
-            if flag_name in ["mass_transfer_flag", ]:
+            if flag_name in ["mass_transfer_flag", "windmark_flag"]:
                 self.update_kernels(update_coeff=True)
             else:
                 self.update_kernels()
@@ -1402,6 +1704,7 @@ class Rubble:
         print(f"{'feedback_flag:':32}", self.feedback_flag)
         print(f"{'closed_box_flag:':32}", self.closed_box_flag)
         print(f"{'dyn_env_flag:':32}", self.dyn_env_flag)
+        print(f"{'windmark_flag:':32}", self.windmark_flag)
         print(f"")
         print(f"{'static_kernel_flag:':32}", self.static_kernel_flag)
         print(f"{'flag_activated:':32}", self.flag_activated)
@@ -1927,6 +2230,7 @@ class Rubble:
             else:
                 self.res4out = np.hstack([self.t, self.sigma.cpu().numpy(), self.Nk.cpu().numpy()])
             self.dat_file.write(self.res4out.tobytes())
+            self.dat_file.flush()
 
     def run(self, tlim, dt, out_dt, cycle_limit=1000000000,
             burnin_dt=1/365.25, no_burnin=False, burnin_out_dt_ratio=1.0,
